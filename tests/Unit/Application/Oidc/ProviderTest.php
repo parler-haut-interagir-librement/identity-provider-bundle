@@ -29,6 +29,8 @@ use Phil\IdentityProviderBundle\Tests\Unit\Fixture\Query;
 use Phil\IdentityProviderBundle\Tests\Unit\Fixture\Services;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\Store\InMemoryStore;
 
 #[CoversClass(ProviderSettings::class)]
 #[CoversClass(SigningKeys::class)]
@@ -124,6 +126,7 @@ final class ProviderTest extends TestCase
         $this->services->clock->modify('+1 second');
         self::assertNull($keys->publicKey($first->kid));
         self::assertCount(2, $keys->jwks()['keys']);
+        self::assertTrue(array_is_list($keys->jwks()['keys']));
         $result = $keys->rotate(true);
         self::assertSame(1, $result['removed']);
         self::assertIsString($result['activated']);
@@ -408,6 +411,24 @@ final class ProviderTest extends TestCase
         $this->assertOAuthError('invalid_token', static fn (): array => $tokens->bearer((string) $response['access_token']));
     }
 
+    public function testUserinfoRefusesTheTokensOfADisabledClient(): void
+    {
+        $account = $this->account();
+        $this->registry()->register('app', 'App', ['https://app.example/cb'], [], ['email']);
+        $response = $this->flow($account, 'openid email');
+        $tokens = $this->tokens();
+        self::assertSame($account->id(), $tokens->bearer((string) $response['access_token'])[0]->id());
+
+        $client = $this->registry()->get('app');
+        self::assertNotNull($client);
+        $this->registry()->disable($client);
+
+        $this->assertOAuthError('invalid_token', static fn (): array => $tokens->bearer((string) $response['access_token']));
+
+        $this->clients->remove($client);
+        $this->assertOAuthError('invalid_token', static fn (): array => $tokens->bearer((string) $response['access_token']));
+    }
+
     public function testConsentWithdrawalRevokesTheClientsTokens(): void
     {
         $account = $this->account();
@@ -475,7 +496,7 @@ final class ProviderTest extends TestCase
 
     private function keys(): SigningKeys
     {
-        return new SigningKeys($this->keyStore, new PlainSecretCipher(), $this->settings, $this->services->clock, $this->services->journal);
+        return new SigningKeys($this->keyStore, new PlainSecretCipher(), $this->settings, $this->services->clock, new LockFactory(new InMemoryStore()), $this->services->journal);
     }
 
     private function registry(): ClientRegistry

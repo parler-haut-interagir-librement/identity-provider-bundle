@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Phil\IdentityProviderBundle\Application\Oidc;
 
+use Closure;
 use DateTimeImmutable;
 use Jose\Component\Core\JWK;
 use Phil\IdentityProviderBundle\Application\Contract\SecretCipher;
@@ -13,6 +14,7 @@ use Phil\IdentityProviderBundle\Application\Journal;
 use Phil\IdentityProviderBundle\Domain\Contract\SigningKeyRepository;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\SigningKey;
 use Psr\Clock\ClockInterface;
+use Symfony\Component\Lock\LockFactory;
 
 /**
  * The keys of the provider and their rotation.
@@ -21,14 +23,27 @@ use Psr\Clock\ClockInterface;
  * activates the pending key once it has been published for `keyActivationDelay` — retiring the active one —, and
  * creates the next pending key. Clients that cache the key set thus see each key before it signs and keep it until
  * the last token it signed has expired. A provider without any key creates and activates one at once.
+ *
+ * The first key and each rotation are made under one lock, `phil_identity_provider.signing_keys`, the keys read again
+ * once it is held: instances that start or rotate at the same time make one key, not one each. Every read still
+ * settles what a lock not shared by every server, or keys written before, may have left: of several active keys, all
+ * but the one activated last — the greatest identifier breaking a tie — are retired, and stay published for the tokens
+ * they signed; of several pending keys, all but the oldest are removed, having signed nothing. Every instance settles
+ * the same way, so that they all sign with the same key.
  */
 final readonly class SigningKeys
 {
+    public const string LOCK = 'phil_identity_provider.signing_keys';
+
+    /**
+     * @param LockFactory $locks its store shared by every server of the provider
+     */
     public function __construct(
         private SigningKeyRepository $keys,
         private SecretCipher $cipher,
         private ProviderSettings $settings,
         private ClockInterface $clock,
+        private LockFactory $locks,
         private ?Journal $journal = null,
     ) {
     }
@@ -40,13 +55,17 @@ final readonly class SigningKeys
      */
     public function active(): PrivateKey
     {
-        $active = array_find($this->keys->all(), static fn (SigningKey $key): bool => $key->isActive());
+        $active = array_find($this->settled(), static fn (SigningKey $key): bool => $key->isActive()) ?? $this->exclusively(function (): SigningKey {
+            $active = array_find($this->settled(), static fn (SigningKey $key): bool => $key->isActive());
 
-        if (null === $active) {
-            $active = $this->create();
-            $active->activate($this->clock->now());
-            $this->keys->save($active);
-        }
+            if (null === $active) {
+                $active = $this->create();
+                $active->activate($this->clock->now());
+                $this->keys->save($active);
+            }
+
+            return $active;
+        });
 
         return PrivateKey::fromMaterial($active->algorithm(), $active->kid(), $this->cipher->open($active->privateMaterial(), $this->context($active->kid())));
     }
@@ -80,6 +99,14 @@ final readonly class SigningKeys
      */
     public function rotate(bool $immediately = false): array
     {
+        return $this->exclusively(fn (): array => $this->rotateNow($immediately));
+    }
+
+    /**
+     * @return array{removed: int, activated: ?string, created: ?string}
+     */
+    private function rotateNow(bool $immediately): array
+    {
         $now = $this->clock->now();
         $removed = 0;
         [$activated, $created] = [null, null];
@@ -91,7 +118,7 @@ final readonly class SigningKeys
             }
         }
 
-        $keys = $this->keys->all();
+        $keys = $this->settled();
         $pending = array_find($keys, static fn (SigningKey $key): bool => $key->isPending());
         $active = array_find($keys, static fn (SigningKey $key): bool => $key->isActive());
 
@@ -118,6 +145,63 @@ final readonly class SigningKeys
         $this->journal?->record(IdentityEventType::SigningKeyRotated, null, ['activated' => $activated, 'created' => $created, 'removed' => $removed]);
 
         return ['removed' => $removed, 'activated' => $activated, 'created' => $created];
+    }
+
+    /**
+     * Runs the work under the lock of the keys, waiting for another instance to release it; the lock is released by the
+     * work's end, not left to the destruction of its object.
+     *
+     * @template T
+     *
+     * @param Closure(): T $work
+     *
+     * @return T
+     */
+    private function exclusively(Closure $work): mixed
+    {
+        $lock = $this->locks->createLock(self::LOCK, autoRelease: false);
+        $lock->acquire(true);
+
+        try {
+            return $work();
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
+     * Every key, at most one of them active and one pending, the extra ones retired or removed.
+     *
+     * @return list<SigningKey>
+     */
+    private function settled(): array
+    {
+        $keys = $this->keys->all();
+        $active = array_filter($keys, static fn (SigningKey $key): bool => $key->isActive());
+        $pending = array_filter($keys, static fn (SigningKey $key): bool => $key->isPending());
+
+        if (\count($active) < 2 && \count($pending) < 2) {
+            return $keys;
+        }
+
+        usort($active, static fn (SigningKey $a, SigningKey $b): int => [$b->activatedAt(), $b->kid()] <=> [$a->activatedAt(), $a->kid()]);
+        $retired = \array_slice($active, 1);
+        $now = $this->clock->now();
+
+        foreach ($retired as $key) {
+            $key->retire($now);
+        }
+
+        $this->keys->save(...$retired);
+        $removed = \array_slice($pending, 1);
+
+        foreach ($removed as $key) {
+            $this->keys->remove($key);
+        }
+
+        $this->journal?->record(IdentityEventType::SigningKeyRotated, null, ['retired' => implode(' ', array_map(static fn (SigningKey $key): string => $key->kid(), $retired)), 'removed' => \count($removed)]);
+
+        return $this->keys->all();
     }
 
     /**

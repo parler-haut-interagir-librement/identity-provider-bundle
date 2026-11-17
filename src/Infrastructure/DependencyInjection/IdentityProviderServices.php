@@ -12,6 +12,7 @@ use Phil\IdentityProviderBundle\Application\Contract\AuditRecorder;
 use Phil\IdentityProviderBundle\Application\Contract\ChallengeStore;
 use Phil\IdentityProviderBundle\Application\Contract\SecretCipher;
 use Phil\IdentityProviderBundle\Application\Contract\SmsSender;
+use Phil\IdentityProviderBundle\Application\Contract\Transactions;
 use Phil\IdentityProviderBundle\Application\ExternalIdentities;
 use Phil\IdentityProviderBundle\Application\Journal;
 use Phil\IdentityProviderBundle\Application\Modules;
@@ -53,6 +54,7 @@ use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineLinkedIdentityRe
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrinePasskeyRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineSecondFactorRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineSigningKeyRepository;
+use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineTransactions;
 use Phil\IdentityProviderBundle\Infrastructure\Federation\ExternalProviders;
 use Phil\IdentityProviderBundle\Infrastructure\Http\AccountController;
 use Phil\IdentityProviderBundle\Infrastructure\Http\AuthenticatorRouteController;
@@ -70,6 +72,7 @@ use Phil\IdentityProviderBundle\Infrastructure\Http\SessionController;
 use Phil\IdentityProviderBundle\Infrastructure\Http\StepUpController;
 use Phil\IdentityProviderBundle\Infrastructure\Http\TotpController;
 use Phil\IdentityProviderBundle\Infrastructure\Mailer\MailerAccountMailer;
+use Phil\IdentityProviderBundle\Infrastructure\Memory\ImmediateTransactions;
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemoryAccountRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemoryAccountSessionRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemoryClientRepository;
@@ -85,6 +88,7 @@ use Phil\IdentityProviderBundle\Infrastructure\Secret\PlainSecretCipher;
 use Phil\IdentityProviderBundle\Infrastructure\Security\AccountUserChecker;
 use Phil\IdentityProviderBundle\Infrastructure\Security\AccountUserProvider;
 use Phil\IdentityProviderBundle\Infrastructure\Security\ExternalAuthenticator;
+use Phil\IdentityProviderBundle\Infrastructure\Security\LoginRateLimiter;
 use Phil\IdentityProviderBundle\Infrastructure\Security\OneTimeCodeAuthenticator;
 use Phil\IdentityProviderBundle\Infrastructure\Security\PasskeyAuthenticator;
 use Phil\IdentityProviderBundle\Infrastructure\Security\PasswordSignInListener;
@@ -99,6 +103,7 @@ use Phil\Passwords\Breach\Adapter\PwnedPasswordsSource;
 use Phil\Passwords\Breach\BreachChecker;
 use Phil\Passwords\Strength\Score;
 use Phil\Passwords\Strength\StrengthEstimator;
+use Phil\RateLimit\RateLimitGuard;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
@@ -110,6 +115,8 @@ use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\KeyManagement\EncrypterInterface;
 use Symfony\Component\Mailer\MailerInterface;
 use Symfony\Component\Notifier\TexterInterface;
+use Symfony\Component\RateLimiter\RateLimiterFactory;
+use Symfony\Component\RateLimiter\Storage\CacheStorage;
 use Symfony\Component\Security\Http\Event\CheckPassportEvent;
 use Symfony\Component\Security\Http\Event\LoginFailureEvent;
 use Symfony\Component\Security\Http\Event\LoginSuccessEvent;
@@ -136,6 +143,7 @@ use Symfony\Component\Security\Http\LoginLink\LoginLinkHandlerInterface;
  *     mailer: array{from: ?string},
  *     password: array{min_score: int<0, 4>, breach_check: bool, http_client: string},
  *     lockout: array{threshold: positive-int, base: positive-int, max: positive-int},
+ *     login_limiter: array{enabled: bool, max_attempts: positive-int, network_max_attempts: positive-int, account_max_attempts: positive-int, interval: string, cache_pool: string, lock_factory: ?string, single_server: bool},
  *     links: array{verify_lifetime: positive-int, reset_lifetime: positive-int},
  *     passkeys: array{rp_id: ?string, rp_name: ?string, origins: list<string>, require_user_verification: bool},
  *     totp: array{issuer: ?string, window: int<0, 10>},
@@ -143,8 +151,8 @@ use Symfony\Component\Security\Http\LoginLink\LoginLinkHandlerInterface;
  *     step_up: array{attribute: string, lifetime: positive-int},
  *     sessions: array{touch_interval: non-negative-int},
  *     external: array{link_verified_email: bool, register: bool},
- *     oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool},
- *     secrets: array{kms_key: ?string, encrypter: string, decrypter: string},
+ *     oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string},
+ *     secrets: array{kms_key: ?string, allow_plaintext_secrets: bool, encrypter: string, decrypter: string},
  *     audit: string,
  * }
  */
@@ -155,6 +163,9 @@ final class IdentityProviderServices
     public const string STORE_MEMORY = 'memory';
 
     public const string USER_PROVIDER = 'phil_identity_provider.user_provider';
+
+    /** The limiter that the firewall's `login_throttling` names with its option `limiter`. */
+    public const string LOGIN_LIMITER = 'phil_identity_provider.login_limiter';
 
     public const string USER_CHECKER = 'phil_identity_provider.user_checker';
 
@@ -195,6 +206,7 @@ final class IdentityProviderServices
     {
         $modules = array_keys(array_filter($config['modules']));
         self::assertModules($modules, $config);
+        self::assertSecrets($modules, $config['secrets'], interface_exists(EncrypterInterface::class));
         $clock = new Reference($config['clock']);
 
         $container->register(Modules::class, Modules::class)->setArguments([$modules]);
@@ -208,6 +220,28 @@ final class IdentityProviderServices
         }
 
         self::pages($container, $config, $modules);
+    }
+
+    /**
+     * The modules "totp" and "oidc" keep secrets — the TOTP secrets, the private signing keys —: they are encrypted under
+     * `secrets.kms_key`, and kept in clear only when `secrets.allow_plaintext_secrets` says so. A key without the
+     * KeyManagement component is refused rather than ignored.
+     *
+     * @param list<string>                                                $modules
+     * @param array{kms_key: ?string, allow_plaintext_secrets: bool, ...} $secrets
+     * @param bool                                                        $keyManagement whether `symfony/key-management` is installed
+     *
+     * @throws InvalidConfigurationException
+     */
+    public static function assertSecrets(array $modules, array $secrets, bool $keyManagement): void
+    {
+        if (null !== $secrets['kms_key'] && !$keyManagement) {
+            throw new InvalidConfigurationException('"secrets.kms_key" needs symfony/key-management: install it, the secrets are never kept in clear in its place.');
+        }
+
+        if (null === $secrets['kms_key'] && !$secrets['allow_plaintext_secrets'] && [] !== array_intersect([Modules::TOTP, Modules::OIDC], $modules)) {
+            throw new InvalidConfigurationException('The modules "totp" and "oidc" keep secrets: set "secrets.kms_key" to encrypt them, or "secrets.allow_plaintext_secrets" to true to keep them in clear.');
+        }
     }
 
     /**
@@ -239,6 +273,13 @@ final class IdentityProviderServices
      */
     private static function stores(ContainerBuilder $container, array $config, array $modules): void
     {
+        if (self::STORE_DOCTRINE === $config['store']) {
+            $container->register(Transactions::class, DoctrineTransactions::class)
+                ->setArguments([new Reference(\sprintf('doctrine.orm.%s_entity_manager', $config['entity_manager']))]);
+        } else {
+            $container->register(Transactions::class, ImmediateTransactions::class);
+        }
+
         foreach (self::REPOSITORIES as $module => $repositories) {
             if (!\in_array($module, $modules, true)) {
                 continue;
@@ -275,7 +316,7 @@ final class IdentityProviderServices
         $container->register(Journal::class, Journal::class)
             ->setArguments([new Reference(AuditRecorder::class), new Reference('event_dispatcher', ContainerInterface::NULL_ON_INVALID_REFERENCE)]);
 
-        if (null !== $config['secrets']['kms_key'] && interface_exists(EncrypterInterface::class)) {
+        if (null !== $config['secrets']['kms_key']) {
             $container->register(SecretCipher::class, KeyManagementSecretCipher::class)
                 ->setArguments([new Reference($config['secrets']['encrypter']), new Reference($config['secrets']['decrypter']), $config['secrets']['kms_key']]);
         } else {
@@ -301,14 +342,53 @@ final class IdentityProviderServices
             ->setArguments([new Reference(StrengthEstimator::class.' $phil_identity_provider'), Score::from($config['password']['min_score']), $breaches]);
         $container->register(LockoutPolicy::class, LockoutPolicy::class)
             ->setArguments([$config['lockout']['threshold'], $config['lockout']['base'], $config['lockout']['max']]);
+        self::loginLimiter($container, $config['login_limiter'], $config['secret'], class_exists(RateLimiterFactory::class));
         $container->register(Accounts::class, Accounts::class)
-            ->setArguments([new Reference(AccountRepository::class), new Reference('security.user_password_hasher'), new Reference(PasswordRules::class), new Reference(Journal::class), $clock, new Reference(LockoutPolicy::class)])
+            ->setArguments([new Reference(AccountRepository::class), new Reference('security.user_password_hasher'), new Reference(PasswordRules::class), new Reference(Journal::class), $clock, new Reference(LockoutPolicy::class), new Reference(Sessions::class, ContainerInterface::NULL_ON_INVALID_REFERENCE)])
             ->setPublic(true);
         $container->register(SignedLinks::class, SignedLinks::class)
             ->setArguments([$config['secret'], $clock, $config['links']['verify_lifetime'], $config['links']['reset_lifetime']]);
         $container->register(AccountLinks::class, AccountLinks::class)
             ->setArguments([new Reference(SignedLinks::class), new Reference('router'), new Reference(AccountRepository::class), new Reference(Journal::class), $mailer])
             ->setPublic(true);
+    }
+
+    /**
+     * The limiter of the firewall's `login_throttling`, when `login_limiter` is enabled: three counts of the Rate Limiter
+     * component in the cache pool named, under the lock factory named. The pool is handed to `RateLimitGuard`, which
+     * refuses in the prod environment a pool local to each server unless `single_server` says the application runs on one.
+     *
+     * @param array{enabled: bool, max_attempts: positive-int, network_max_attempts: positive-int, account_max_attempts: positive-int, interval: string, cache_pool: string, lock_factory: ?string, single_server: bool} $limiter
+     * @param bool                                                                                                                                                                                                       $installed whether `symfony/rate-limiter` is there
+     *
+     * @throws InvalidConfigurationException when it is enabled without the component
+     */
+    public static function loginLimiter(ContainerBuilder $container, array $limiter, string $secret, bool $installed): void
+    {
+        if (!$limiter['enabled']) {
+            return;
+        }
+
+        if (!$installed) {
+            throw new InvalidConfigurationException('"login_limiter" needs symfony/rate-limiter: install it, or turn the limiter off.');
+        }
+
+        $storage = new Definition(CacheStorage::class, [new Reference($limiter['cache_pool'])]);
+        $lock = null === $limiter['lock_factory'] ? null : new Reference($limiter['lock_factory']);
+        $factory = static fn (string $count, int $limit): Definition => new Definition(RateLimiterFactory::class, [
+            ['id' => 'phil_identity_provider.login.'.$count, 'policy' => 'sliding_window', 'limit' => $limit, 'interval' => $limiter['interval']],
+            $storage,
+            $lock,
+        ]);
+
+        $container->register(self::LOGIN_LIMITER, LoginRateLimiter::class)->setArguments([
+            $factory('network', $limiter['network_max_attempts']),
+            $factory('local', $limiter['max_attempts']),
+            $factory('account', $limiter['account_max_attempts']),
+            $secret,
+        ]);
+        $container->setAlias(LoginRateLimiter::class, self::LOGIN_LIMITER);
+        RateLimitGuard::watch($container, $limiter['cache_pool'], 'phil_identity_provider.login_limiter.cache_pool', $limiter['single_server'], 'enabled');
     }
 
     /**
@@ -336,6 +416,7 @@ final class IdentityProviderServices
                     new Reference(AccountMailer::class, ContainerInterface::NULL_ON_INVALID_REFERENCE),
                     \in_array(Modules::OIDC, $modules, true) ? new Reference(GrantRepository::class) : null,
                     $config['sessions']['touch_interval'],
+                    new Reference(Transactions::class),
                 ])
                 ->setPublic(true);
             $container->register(SessionListener::class, SessionListener::class)
@@ -431,7 +512,7 @@ final class IdentityProviderServices
             $config['oidc']['retired_key_retention'],
         ]);
         $container->register(SigningKeys::class, SigningKeys::class)
-            ->setArguments([new Reference(SigningKeyRepository::class), new Reference(SecretCipher::class), new Reference(ProviderSettings::class), $clock, $journal])
+            ->setArguments([new Reference(SigningKeyRepository::class), new Reference(SecretCipher::class), new Reference(ProviderSettings::class), $clock, new Reference($config['oidc']['lock_factory']), $journal])
             ->setPublic(true);
         $container->register(ClientRegistry::class, ClientRegistry::class)
             ->setArguments([new Reference(ClientRepository::class), $clock, new Reference(ProviderSettings::class), $journal, $config['oidc']['allow_localhost']])

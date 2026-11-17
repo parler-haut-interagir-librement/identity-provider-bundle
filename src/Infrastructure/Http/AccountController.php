@@ -10,6 +10,7 @@ use Phil\IdentityProviderBundle\Application\Exception\Refused;
 use Phil\IdentityProviderBundle\Application\Modules;
 use Phil\IdentityProviderBundle\Application\SignedLinks;
 use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
+use Phil\IdentityProviderBundle\Infrastructure\Security\SessionListener;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -64,14 +65,27 @@ final readonly class AccountController
         return $this->pages->render('account/register', ['errors' => $errors, 'email' => $email, 'password' => $this->modules->has(Modules::PASSWORD)], [] === $errors ? Response::HTTP_OK : Response::HTTP_UNPROCESSABLE_ENTITY);
     }
 
+    /**
+     * The link of the email shows a page that asks to confirm; the address is verified by the form it posts. Opening the
+     * link, as the scanners of mail services do, changes nothing.
+     */
     public function verifyEmail(Request $request): Response
     {
-        $account = $this->links->account(SignedLinks::VERIFY, $request->query->getString('account'), $request->query->getInt('expires'), $request->query->getString('signature'));
+        $parameters = $request->isMethod('POST') ? $request->request : $request->query;
+        $id = $parameters->getString('account');
+        $expires = $parameters->getInt('expires');
+        $signature = $parameters->getString('signature');
+        $account = $this->links->account(SignedLinks::VERIFY, $id, $expires, $signature);
 
         if (!$account instanceof Account) {
             return $this->pages->render('account/link_invalid', [], Response::HTTP_GONE);
         }
 
+        if (!$request->isMethod('POST')) {
+            return $this->pages->render('account/verify', ['link' => ['account' => $id, 'expires' => $expires, 'signature' => $signature]]);
+        }
+
+        $this->pages->checkCsrf($request);
         $this->accounts->verifyEmail($account);
 
         return $this->pages->render('account/verified');
@@ -115,8 +129,9 @@ final readonly class AccountController
             $this->pages->checkCsrf($request);
 
             try {
-                $this->accounts->changePassword($account, $request->request->getString('password'));
-                $this->accounts->verifyEmail($account);
+                if (!$this->accounts->resetPassword($account, $request->request->getString('password'))) {
+                    return $this->pages->render('account/link_invalid', [], Response::HTTP_GONE);
+                }
 
                 return $this->pages->render('account/reset_done');
             } catch (Refused $refused) {
@@ -174,7 +189,7 @@ final readonly class AccountController
         $this->pages->checkCsrf($request);
 
         try {
-            $this->accounts->changePassword($account, $request->request->getString('password'));
+            $this->accounts->changePassword($account, $request->request->getString('password'), keepSession: SessionListener::id($request));
         } catch (Refused $refused) {
             return $this->pages->render('account/account', ['modules' => $this->modules->enabled(), 'sent' => false, 'saved' => false, 'errors' => $refused->reasons], Response::HTTP_UNPROCESSABLE_ENTITY);
         }

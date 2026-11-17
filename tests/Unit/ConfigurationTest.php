@@ -59,6 +59,16 @@ final class ConfigurationTest extends TestCase
             'base' => 60,
             'max' => 3600,
         ],
+        'login_limiter' => [
+            'enabled' => false,
+            'max_attempts' => 5,
+            'network_max_attempts' => 25,
+            'account_max_attempts' => 50,
+            'interval' => '15 minutes',
+            'cache_pool' => 'cache.rate_limiter',
+            'lock_factory' => null,
+            'single_server' => false,
+        ],
         'links' => [
             'verify_lifetime' => 86400,
             'reset_lifetime' => 3600,
@@ -101,9 +111,11 @@ final class ConfigurationTest extends TestCase
             'key_activation_delay' => 86400,
             'retired_key_retention' => 604800,
             'allow_localhost' => false,
+            'lock_factory' => 'lock.factory',
         ],
         'secrets' => [
             'kms_key' => null,
+            'allow_plaintext_secrets' => false,
             'encrypter' => 'key_management.encrypter',
             'decrypter' => 'key_management.decrypter',
         ],

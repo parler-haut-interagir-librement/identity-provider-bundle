@@ -10,6 +10,7 @@ use Phil\IdentityProviderBundle\Application\Modules;
 use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
 use Phil\IdentityProviderBundle\Infrastructure\DependencyInjection\IdentityProviderServices;
 use Phil\IdentityProviderBundle\Infrastructure\DependencyInjection\KitSubdirectoryPass;
+use Phil\RateLimit\RateLimitGuard;
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
@@ -93,6 +94,19 @@ final class PhilIdentityProviderBundle extends AbstractBundle
                     ->integerNode('max')->info('The longest lock, in seconds.')->defaultValue(3600)->min(1)->end()
                 ->end()
             ->end()
+            ->arrayNode('login_limiter')
+                ->info('The limiter of the firewall\'s login_throttling, its option "limiter: phil_identity_provider.login_limiter": per address, per identifier and address, and per identifier whatever the address.')
+                ->canBeEnabled()
+                ->children()
+                    ->integerNode('max_attempts')->info('The sign-ins per identifier and address in each interval.')->defaultValue(5)->min(1)->end()
+                    ->integerNode('network_max_attempts')->info('The sign-ins per address, or IPv6 /64 network, in each interval, whatever the identifier.')->defaultValue(25)->min(1)->end()
+                    ->integerNode('account_max_attempts')->info('The sign-ins per identifier in each interval, whatever the address: against guessing spread over many addresses. Anyone who knows the identifier can spend it.')->defaultValue(50)->min(1)->end()
+                    ->scalarNode('interval')->info('The window of the counts, in the format of the Rate Limiter component.')->defaultValue('15 minutes')->cannotBeEmpty()->end()
+                    ->scalarNode('cache_pool')->info('The cache pool of the counts; shared by every server, as Redis or a database, or each server counts on its own.')->defaultValue('cache.rate_limiter')->cannotBeEmpty()->end()
+                    ->scalarNode('lock_factory')->info('A LockFactory service on a shared store, so that two sign-ins at once both count; null counts without a lock.')->defaultNull()->end()
+                    ->booleanNode('single_server')->info('Accepts a cache pool local to the server in the prod environment, for an application on one server.')->defaultFalse()->end()
+                ->end()
+            ->end()
             ->arrayNode('links')
                 ->addDefaultsIfNotSet()
                 ->children()
@@ -158,12 +172,14 @@ final class PhilIdentityProviderBundle extends AbstractBundle
                     ->integerNode('key_activation_delay')->info('The seconds a new key is published before it signs.')->defaultValue(86_400)->min(0)->end()
                     ->integerNode('retired_key_retention')->info('The seconds a retired key stays published.')->defaultValue(604_800)->min(0)->end()
                     ->booleanNode('allow_localhost')->info('Whether redirect addresses on localhost over http are accepted, for development.')->defaultFalse()->end()
+                    ->scalarNode('lock_factory')->info('The LockFactory service that serializes the first signing key and each rotation; its store must be shared by every server.')->defaultValue('lock.factory')->cannotBeEmpty()->end()
                 ->end()
             ->end()
             ->arrayNode('secrets')
                 ->addDefaultsIfNotSet()
                 ->children()
-                    ->scalarNode('kms_key')->info('The key of the KeyManagement component that encrypts TOTP secrets and signing keys; null keeps them in clear.')->defaultNull()->end()
+                    ->scalarNode('kms_key')->info('The key of the KeyManagement component that encrypts TOTP secrets and signing keys; null is refused with the modules "totp" or "oidc" unless allow_plaintext_secrets is true.')->defaultNull()->end()
+                    ->booleanNode('allow_plaintext_secrets')->info('Whether TOTP secrets and signing keys may be stored in clear when no kms_key is set; the database access controls are then their only protection.')->defaultFalse()->end()
                     ->scalarNode('encrypter')->info('Service id of the encrypter of the KeyManagement component.')->defaultValue('key_management.encrypter')->cannotBeEmpty()->end()
                     ->scalarNode('decrypter')->info('Service id of the decrypter of the KeyManagement component.')->defaultValue('key_management.decrypter')->cannotBeEmpty()->end()
                 ->end()
@@ -176,6 +192,7 @@ final class PhilIdentityProviderBundle extends AbstractBundle
     public function build(ContainerBuilder $container): void
     {
         $container->addCompilerPass(new KitSubdirectoryPass());
+        $container->addCompilerPass(new RateLimitGuard());
     }
 
     #[Override]
@@ -223,7 +240,7 @@ final class PhilIdentityProviderBundle extends AbstractBundle
         }
 
         unset($config['enabled']);
-        /** @phpstan-var array{secret: string, site_name: string, modules: array<string, bool>, store: string, entity_manager: string, clock: string, layout: string, kit_subdirectory: ?string, registration: bool, require_verified_email: bool, login_route: ?string, default_target: string, open_routes: list<string>, mailer: array{from: ?string}, password: array{min_score: int<0, 4>, breach_check: bool, http_client: string}, lockout: array{threshold: positive-int, base: positive-int, max: positive-int}, links: array{verify_lifetime: positive-int, reset_lifetime: positive-int}, passkeys: array{rp_id: ?string, rp_name: ?string, origins: list<string>, require_user_verification: bool}, totp: array{issuer: ?string, window: int<0, 10>}, sms: array{sender: ?string, from: string, message: string, lifetime: positive-int, attempts: positive-int}, step_up: array{attribute: string, lifetime: positive-int}, sessions: array{touch_interval: non-negative-int}, external: array{link_verified_email: bool, register: bool}, oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool}, secrets: array{kms_key: ?string, encrypter: string, decrypter: string}, audit: string} $config */
+        /** @phpstan-var array{secret: string, site_name: string, modules: array<string, bool>, store: string, entity_manager: string, clock: string, layout: string, kit_subdirectory: ?string, registration: bool, require_verified_email: bool, login_route: ?string, default_target: string, open_routes: list<string>, mailer: array{from: ?string}, password: array{min_score: int<0, 4>, breach_check: bool, http_client: string}, lockout: array{threshold: positive-int, base: positive-int, max: positive-int}, login_limiter: array{enabled: bool, max_attempts: positive-int, network_max_attempts: positive-int, account_max_attempts: positive-int, interval: string, cache_pool: string, lock_factory: ?string, single_server: bool}, links: array{verify_lifetime: positive-int, reset_lifetime: positive-int}, passkeys: array{rp_id: ?string, rp_name: ?string, origins: list<string>, require_user_verification: bool}, totp: array{issuer: ?string, window: int<0, 10>}, sms: array{sender: ?string, from: string, message: string, lifetime: positive-int, attempts: positive-int}, step_up: array{attribute: string, lifetime: positive-int}, sessions: array{touch_interval: non-negative-int}, external: array{link_verified_email: bool, register: bool}, oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string}, secrets: array{kms_key: ?string, allow_plaintext_secrets: bool, encrypter: string, decrypter: string}, audit: string} $config */
         IdentityProviderServices::register($builder, $config);
     }
 
