@@ -10,9 +10,9 @@ in the recipes repository of PHIL, read once the application lists that reposito
 it, register the bundle and write the configuration by hand, as below. The firewall stays the application's to write.
 
 The package needs PHP 8.5 or later with the `mbstring`, `openssl` and `sodium` extensions, Symfony 8.2 or later,
-Doctrine ORM 3.7 or later and `web-token/jwt-library` 4.2 or later. The Mailer component sends its emails, the Notifier component its text messages, the
-KeyManagement component encrypts its secrets, the Rate Limiter component counts the sign-ins per identifier,
-StimulusBundle serves its passkey controller, and Symfony UX Twig Component with the recipes of the kit draws its
+Doctrine ORM 3.7 or later and `web-token/jwt-library` 4.2 or later; the Rate Limiter component counts the
+registrations and, with `login_limiter`, the sign-ins per identifier. The Mailer component sends its emails, the
+Notifier component its text messages, the KeyManagement component encrypts its secrets, StimulusBundle serves its passkey controller, and Symfony UX Twig Component with the recipes of the kit draws its
 pages: each is optional. The modules `totp` and `oidc` keep secrets, and refuse to start without `secrets.kms_key`
 unless `secrets.allow_plaintext_secrets: true` says they may stay in clear.
 
@@ -25,6 +25,44 @@ Phil\IdentityProviderBundle\PhilIdentityProviderBundle::class => ['all' => true]
 
 The bundle maps the tables of the modules turned on for Doctrine and prepends the password hasher of its users:
 Argon2id (`sodium`). Generate the migration of the tables with `bin/console doctrine:migrations:diff`.
+
+## Upgrading from 0.2
+
+- On MySQL and MariaDB, the keys of the tables take the binary collation: run `bin/console doctrine:migrations:diff`,
+  read the `ALTER TABLE … MODIFY … CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` it writes for the columns listed in
+  [Tables](reference.md#tables), and migrate. Rows that the former collation took for one — `App` and `app` — stay
+  two rows. PostgreSQL and SQLite need no migration.
+- Set `public_origin` or `framework.trusted_hosts`, as [above](#where-the-links-point): without either, the `prod`
+  environment no longer boots.
+- Registration is limited by default; `registration: true` and `registration: false` keep working, and
+  `registration: { rate_limit: false }` turns the limits off.
+- With the module `oidc`, the schema gains the table `phil_identity_assertion`, the columns `jwks`, `resources` and
+  `backchannel_logout_uri` and `sector_identifier` of `phil_identity_client`, and the column `audience` of `phil_identity_token`, whose `account_id` becomes nullable: run
+  `bin/console doctrine:migrations:diff` and migrate. Every new column is nullable; no row changes.
+- A refresh token issued in a session is refused once the session ends, its family revoked
+  (`oidc.refresh_token_bound_to_session`, on by default); set it to `false` to keep the former behaviour.
+- `TokenController::AUTH_METHODS` is gone: the discovery document reads the methods from
+  `oidc.client_authentication.methods`. `IssuedToken::accountId()` returns null for a token of the `client_credentials`
+  grant, and `GrantRepository` gains `useAssertion()`: an implementation of its own adds it. `Tokens::bearer()` gives a
+  third member, the client of the token.
+
+## Where the links point
+
+The links of the emails must never take the host a request names. Set the canonical address of the site, or the hosts
+it answers, or both:
+
+```yaml
+# config/packages/phil_identity_provider.yaml
+phil_identity_provider:
+    public_origin: '%env(APP_PUBLIC_ORIGIN)%'   # https://example.com
+
+# config/packages/framework.yaml
+framework:
+    trusted_hosts: ['^example\.com$']
+```
+
+In the `prod` environment the bundle refuses to boot when neither is set: see [Where the links
+point](accounts.md#where-the-links-point).
 
 ## The firewall
 

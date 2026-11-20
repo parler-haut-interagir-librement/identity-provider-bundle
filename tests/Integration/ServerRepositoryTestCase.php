@@ -9,12 +9,15 @@ use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\DriverManager;
 use Doctrine\DBAL\Tools\DsnParser;
 use Doctrine\ORM\EntityManager;
+use Doctrine\ORM\Events;
 use Doctrine\ORM\ORMSetup;
 use Override;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\AuthorizationCode;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\IssuedToken;
+use Phil\IdentityProviderBundle\Domain\Model\Oidc\UsedAssertion;
 use Phil\IdentityProviderBundle\Domain\Model\Totp\TotpCredential;
 use Phil\IdentityProviderBundle\Domain\Oidc\TokenKind;
+use Phil\IdentityProviderBundle\Infrastructure\Doctrine\BinaryKeysListener;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineGrantRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineSecondFactorRepository;
 use Phil\IdentityProviderBundle\Tests\Unit\Infrastructure\DoctrineRepositoryTestCase;
@@ -59,6 +62,16 @@ abstract class ServerRepositoryTestCase extends DoctrineRepositoryTestCase
         self::assertNotNull($theirs);
         self::assertTrue($other->rotateToken($theirs, $now));
         self::assertFalse($this->grants()->rotateToken($mine, $now));
+    }
+
+    public function testTwoConnectionsRecordAClientAssertionOnce(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $other = new DoctrineGrantRepository($this->second());
+
+        self::assertTrue($other->useAssertion(UsedAssertion::record('machine', 'jti', $now)));
+        self::assertFalse($this->grants()->useAssertion(UsedAssertion::record('machine', 'jti', $now)));
+        self::assertTrue($this->grants()->useAssertion(UsedAssertion::record('machine', 'JTI', $now)), 'The identifier compares byte by byte.');
     }
 
     public function testTwoConnectionsAcceptATotpCounterOnce(): void
@@ -108,6 +121,7 @@ abstract class ServerRepositoryTestCase extends DoctrineRepositoryTestCase
             $configuration = ORMSetup::createAttributeMetadataConfig([\dirname(__DIR__, 2).'/src/Domain/Model'], true);
             $configuration->enableNativeLazyObjects(true);
             $this->second = new EntityManager($this->connection(), $configuration);
+            $this->second->getEventManager()->addEventListener(Events::loadClassMetadata, new BinaryKeysListener());
         }
 
         return $this->second;

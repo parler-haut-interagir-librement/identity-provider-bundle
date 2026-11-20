@@ -4,12 +4,17 @@ declare(strict_types=1);
 
 namespace Phil\IdentityProviderBundle\Infrastructure\DependencyInjection;
 
+use DateMalformedStringException;
+use DateTimeImmutable;
 use Phil\AuditBundle\Application\AuditTrail;
 use Phil\IdentityProviderBundle\Application\AccountLinks;
 use Phil\IdentityProviderBundle\Application\Accounts;
 use Phil\IdentityProviderBundle\Application\Contract\AccountMailer;
 use Phil\IdentityProviderBundle\Application\Contract\AuditRecorder;
 use Phil\IdentityProviderBundle\Application\Contract\ChallengeStore;
+use Phil\IdentityProviderBundle\Application\Contract\ClaimsProvider;
+use Phil\IdentityProviderBundle\Application\Contract\LinkOrigin;
+use Phil\IdentityProviderBundle\Application\Contract\LogoutNotifier;
 use Phil\IdentityProviderBundle\Application\Contract\SecretCipher;
 use Phil\IdentityProviderBundle\Application\Contract\SmsSender;
 use Phil\IdentityProviderBundle\Application\Contract\Transactions;
@@ -18,9 +23,11 @@ use Phil\IdentityProviderBundle\Application\Journal;
 use Phil\IdentityProviderBundle\Application\Modules;
 use Phil\IdentityProviderBundle\Application\Oidc\Authorization;
 use Phil\IdentityProviderBundle\Application\Oidc\ClientRegistry;
+use Phil\IdentityProviderBundle\Application\Oidc\LogoutTokens;
 use Phil\IdentityProviderBundle\Application\Oidc\ProviderSettings;
 use Phil\IdentityProviderBundle\Application\Oidc\SigningKeys;
 use Phil\IdentityProviderBundle\Application\Oidc\Tokens;
+use Phil\IdentityProviderBundle\Application\Oidc\UserClaims;
 use Phil\IdentityProviderBundle\Application\Passkeys;
 use Phil\IdentityProviderBundle\Application\PasswordRules;
 use Phil\IdentityProviderBundle\Application\PhoneVerification;
@@ -36,6 +43,8 @@ use Phil\IdentityProviderBundle\Domain\Contract\PasskeyRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\SecondFactorRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\SigningKeyRepository;
 use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
+use Phil\IdentityProviderBundle\Domain\Oidc\ClientAuthMethod;
+use Phil\IdentityProviderBundle\Domain\Oidc\SubjectType;
 use Phil\IdentityProviderBundle\Domain\Security\LockoutPolicy;
 use Phil\IdentityProviderBundle\Domain\Security\RecoveryCodes;
 use Phil\IdentityProviderBundle\Domain\WebAuthn\RelyingParty;
@@ -45,7 +54,9 @@ use Phil\IdentityProviderBundle\Infrastructure\Console\CreateClientCommand;
 use Phil\IdentityProviderBundle\Infrastructure\Console\DisableClientCommand;
 use Phil\IdentityProviderBundle\Infrastructure\Console\ListClientsCommand;
 use Phil\IdentityProviderBundle\Infrastructure\Console\PurgeCommand;
+use Phil\IdentityProviderBundle\Infrastructure\Console\ReplaceClientKeysCommand;
 use Phil\IdentityProviderBundle\Infrastructure\Console\RotateKeysCommand;
+use Phil\IdentityProviderBundle\Infrastructure\Doctrine\BinaryKeysListener;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineAccountRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineAccountSessionRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Doctrine\DoctrineClientRepository;
@@ -81,8 +92,12 @@ use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemoryLinkedIdentityRepo
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemoryPasskeyRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemorySecondFactorRepository;
 use Phil\IdentityProviderBundle\Infrastructure\Memory\InMemorySigningKeyRepository;
+use Phil\IdentityProviderBundle\Infrastructure\Messenger\MessengerLogoutNotifier;
+use Phil\IdentityProviderBundle\Infrastructure\Messenger\SendLogoutToken;
+use Phil\IdentityProviderBundle\Infrastructure\Messenger\SendLogoutTokenHandler;
 use Phil\IdentityProviderBundle\Infrastructure\Notifier\NotifierSmsSender;
 use Phil\IdentityProviderBundle\Infrastructure\Routing\RouteLoader;
+use Phil\IdentityProviderBundle\Infrastructure\Routing\RouterLinkOrigin;
 use Phil\IdentityProviderBundle\Infrastructure\Secret\KeyManagementSecretCipher;
 use Phil\IdentityProviderBundle\Infrastructure\Secret\PlainSecretCipher;
 use Phil\IdentityProviderBundle\Infrastructure\Security\AccountUserChecker;
@@ -93,6 +108,7 @@ use Phil\IdentityProviderBundle\Infrastructure\Security\OneTimeCodeAuthenticator
 use Phil\IdentityProviderBundle\Infrastructure\Security\PasskeyAuthenticator;
 use Phil\IdentityProviderBundle\Infrastructure\Security\PasswordSignInListener;
 use Phil\IdentityProviderBundle\Infrastructure\Security\ReAuthenticationEntryPoint;
+use Phil\IdentityProviderBundle\Infrastructure\Security\RegistrationRateLimiter;
 use Phil\IdentityProviderBundle\Infrastructure\Security\SecondFactorListener;
 use Phil\IdentityProviderBundle\Infrastructure\Security\SessionChallengeStore;
 use Phil\IdentityProviderBundle\Infrastructure\Security\SessionListener;
@@ -114,6 +130,7 @@ use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\KeyManagement\EncrypterInterface;
 use Symfony\Component\Mailer\MailerInterface;
+use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Notifier\TexterInterface;
 use Symfony\Component\RateLimiter\RateLimiterFactory;
 use Symfony\Component\RateLimiter\Storage\CacheStorage;
@@ -122,6 +139,7 @@ use Symfony\Component\Security\Http\Event\LoginFailureEvent;
 use Symfony\Component\Security\Http\Event\LoginSuccessEvent;
 use Symfony\Component\Security\Http\Event\LogoutEvent;
 use Symfony\Component\Security\Http\LoginLink\LoginLinkHandlerInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 /**
  * The services of the configuration, module by module: a module off registers nothing of its own.
@@ -135,7 +153,8 @@ use Symfony\Component\Security\Http\LoginLink\LoginLinkHandlerInterface;
  *     clock: string,
  *     layout: string,
  *     kit_subdirectory: ?string,
- *     registration: bool,
+ *     registration: array{enabled: bool, rate_limit: array{enabled: bool, per_ip: array{limit: positive-int, interval: string}, per_address: array{limit: positive-int, interval: string}, resend_delay: string}},
+ *     public_origin: ?string,
  *     require_verified_email: bool,
  *     login_route: ?string,
  *     default_target: string,
@@ -151,7 +170,7 @@ use Symfony\Component\Security\Http\LoginLink\LoginLinkHandlerInterface;
  *     step_up: array{attribute: string, lifetime: positive-int},
  *     sessions: array{touch_interval: non-negative-int},
  *     external: array{link_verified_email: bool, register: bool},
- *     oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string},
+ *     oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string, extra_scopes: list<string>, client_authentication: array{methods: non-empty-list<string>, clock_skew: int<0, 300>, assertion_max_lifetime: int<1, 3600>}, refresh_token_bound_to_session: bool, session_max_age: ?positive-int, id_token: array{acr: ?string, idp: ?string, session_start: bool}, subject: array{type: string, salt: ?string}, backchannel_logout: array{enabled: bool, bus: string, http_client: string, timeout: positive-int}},
  *     secrets: array{kms_key: ?string, allow_plaintext_secrets: bool, encrypter: string, decrypter: string},
  *     audit: string,
  * }
@@ -169,7 +188,16 @@ final class IdentityProviderServices
 
     public const string USER_CHECKER = 'phil_identity_provider.user_checker';
 
+    /** The parameter of `public_origin`, read when the kernel boots. */
+    public const string PUBLIC_ORIGIN = 'phil_identity_provider.public_origin';
+
+    /** The limits of registration, `registration.rate_limit`. */
+    public const string REGISTRATION_LIMITER = 'phil_identity_provider.registration_limiter';
+
     public const string RE_AUTHENTICATION_ENTRY_POINT = 'phil_identity_provider.re_authentication_entry_point';
+
+    /** The tag of the services that add claims to userinfo. */
+    public const string CLAIMS_PROVIDER_TAG = 'phil_identity_provider.claims_provider';
 
     /** The stores of each module, with their Doctrine and memory implementations. */
     private const array REPOSITORIES = [
@@ -276,6 +304,7 @@ final class IdentityProviderServices
         if (self::STORE_DOCTRINE === $config['store']) {
             $container->register(Transactions::class, DoctrineTransactions::class)
                 ->setArguments([new Reference(\sprintf('doctrine.orm.%s_entity_manager', $config['entity_manager']))]);
+            $container->register(BinaryKeysListener::class, BinaryKeysListener::class)->addTag('doctrine.event_listener', ['event' => 'loadClassMetadata']);
         } else {
             $container->register(Transactions::class, ImmediateTransactions::class);
         }
@@ -346,10 +375,14 @@ final class IdentityProviderServices
         $container->register(Accounts::class, Accounts::class)
             ->setArguments([new Reference(AccountRepository::class), new Reference('security.user_password_hasher'), new Reference(PasswordRules::class), new Reference(Journal::class), $clock, new Reference(LockoutPolicy::class), new Reference(Sessions::class, ContainerInterface::NULL_ON_INVALID_REFERENCE)])
             ->setPublic(true);
+        $container->setParameter(self::PUBLIC_ORIGIN, $config['public_origin']);
+        $container->register(LinkOrigin::class, RouterLinkOrigin::class)
+            ->setArguments([new Reference('router'), '%'.self::PUBLIC_ORIGIN.'%', '%kernel.debug%']);
+        self::registrationLimiter($container, $config['registration'], $config['secret']);
         $container->register(SignedLinks::class, SignedLinks::class)
             ->setArguments([$config['secret'], $clock, $config['links']['verify_lifetime'], $config['links']['reset_lifetime']]);
         $container->register(AccountLinks::class, AccountLinks::class)
-            ->setArguments([new Reference(SignedLinks::class), new Reference('router'), new Reference(AccountRepository::class), new Reference(Journal::class), $mailer])
+            ->setArguments([new Reference(SignedLinks::class), new Reference('router'), new Reference(AccountRepository::class), new Reference(Journal::class), $mailer, new Reference(LinkOrigin::class)])
             ->setPublic(true);
     }
 
@@ -392,6 +425,55 @@ final class IdentityProviderServices
     }
 
     /**
+     * The limits of registration, when it is open and `registration.rate_limit` is on: two sliding windows and a token
+     * bucket of the Rate Limiter component, in the application's cache pool, under `lock.factory` when it is defined.
+     *
+     * @param array{enabled: bool, rate_limit: array{enabled: bool, per_ip: array{limit: positive-int, interval: string}, per_address: array{limit: positive-int, interval: string}, resend_delay: string}} $registration
+     *
+     * @throws InvalidConfigurationException when an interval or the delay is not a duration
+     */
+    public static function registrationLimiter(ContainerBuilder $container, array $registration, string $secret): void
+    {
+        $limits = $registration['rate_limit'];
+
+        if (!$registration['enabled'] || !$limits['enabled']) {
+            return;
+        }
+
+        $storage = new Definition(CacheStorage::class, [new Reference('cache.app')]);
+        $lock = new Reference('lock.factory', ContainerInterface::NULL_ON_INVALID_REFERENCE);
+        $factory = static fn (string $count, array $config): Definition => new Definition(RateLimiterFactory::class, [['id' => 'phil_identity_provider.registration.'.$count] + $config, $storage, $lock]);
+
+        foreach (['per_ip' => $limits['per_ip']['interval'], 'per_address' => $limits['per_address']['interval'], 'resend_delay' => $limits['resend_delay']] as $option => $duration) {
+            self::duration('registration.rate_limit.'.('resend_delay' === $option ? $option : $option.'.interval'), $duration);
+        }
+
+        $container->register(self::REGISTRATION_LIMITER, RegistrationRateLimiter::class)->setArguments([
+            $factory('ip', ['policy' => 'sliding_window', 'limit' => $limits['per_ip']['limit'], 'interval' => $limits['per_ip']['interval']]),
+            $factory('address', ['policy' => 'sliding_window', 'limit' => $limits['per_address']['limit'], 'interval' => $limits['per_address']['interval']]),
+            $factory('resend', ['policy' => 'token_bucket', 'limit' => 1, 'rate' => ['interval' => $limits['resend_delay'], 'amount' => 1]]),
+            $secret,
+        ]);
+        $container->setAlias(RegistrationRateLimiter::class, self::REGISTRATION_LIMITER);
+    }
+
+    /**
+     * @throws InvalidConfigurationException when the text is not a positive duration of the Rate Limiter component, such as "15 minutes"
+     */
+    private static function duration(string $option, string $duration): void
+    {
+        try {
+            $seconds = new DateTimeImmutable('@0')->modify('+'.$duration)->getTimestamp();
+        } catch (DateMalformedStringException) {
+            $seconds = 0;
+        }
+
+        if ($seconds <= 0) {
+            throw new InvalidConfigurationException(\sprintf('"%s" is a duration, such as "15 minutes", not "%s".', $option, $duration));
+        }
+    }
+
+    /**
      * @param Config       $config
      * @param list<string> $modules
      */
@@ -417,6 +499,7 @@ final class IdentityProviderServices
                     \in_array(Modules::OIDC, $modules, true) ? new Reference(GrantRepository::class) : null,
                     $config['sessions']['touch_interval'],
                     new Reference(Transactions::class),
+                    new Reference(LogoutNotifier::class, ContainerInterface::NULL_ON_INVALID_REFERENCE),
                 ])
                 ->setPublic(true);
             $container->register(SessionListener::class, SessionListener::class)
@@ -507,9 +590,19 @@ final class IdentityProviderServices
             $config['oidc']['access_token_lifetime'],
             $config['oidc']['id_token_lifetime'],
             $config['oidc']['refresh_token_lifetime'],
-            ProviderSettings::SCOPES,
+            array_values(array_unique([...ProviderSettings::SCOPES, ...$config['oidc']['extra_scopes']])),
             $config['oidc']['key_activation_delay'],
             $config['oidc']['retired_key_retention'],
+            array_map(ClientAuthMethod::from(...), array_values(array_unique($config['oidc']['client_authentication']['methods']))),
+            $config['oidc']['client_authentication']['clock_skew'],
+            $config['oidc']['client_authentication']['assertion_max_lifetime'],
+            $config['oidc']['refresh_token_bound_to_session'],
+            $config['oidc']['session_max_age'],
+            $config['oidc']['id_token']['acr'],
+            $config['oidc']['id_token']['idp'],
+            $config['oidc']['id_token']['session_start'],
+            SubjectType::from($config['oidc']['subject']['type']),
+            $config['oidc']['subject']['salt'],
         ]);
         $container->register(SigningKeys::class, SigningKeys::class)
             ->setArguments([new Reference(SigningKeyRepository::class), new Reference(SecretCipher::class), new Reference(ProviderSettings::class), $clock, new Reference($config['oidc']['lock_factory']), $journal])
@@ -521,17 +614,33 @@ final class IdentityProviderServices
             ->setArguments([new Reference(ClientRepository::class), new Reference(GrantRepository::class), new Reference(ProviderSettings::class), $clock, $journal])
             ->setPublic(true);
         $container->register(Tokens::class, Tokens::class)
-            ->setArguments([new Reference(ClientRepository::class), new Reference(GrantRepository::class), new Reference(AccountRepository::class), new Reference(SigningKeys::class), new Reference(ProviderSettings::class), $clock, $journal])
+            ->setArguments([new Reference(ClientRepository::class), new Reference(GrantRepository::class), new Reference(AccountRepository::class), new Reference(SigningKeys::class), new Reference(ProviderSettings::class), $clock, $journal, new Reference(AccountSessionRepository::class, ContainerInterface::NULL_ON_INVALID_REFERENCE)])
             ->setPublic(true);
 
-        self::controller($container, MetadataController::class, [new Reference(ProviderSettings::class), new Reference(SigningKeys::class), new Reference('router')]);
+        self::controller($container, MetadataController::class, [new Reference(ProviderSettings::class), new Reference(SigningKeys::class), new Reference('router'), 300, $config['oidc']['backchannel_logout']['enabled']]);
         self::controller($container, AuthorizeController::class, [new Reference(Authorization::class), new Reference(Pages::class), new Reference('security.token_storage'), new Reference('router'), $clock, $config['oidc']['issuer'], new Reference('security.helper')]);
-        self::controller($container, TokenController::class, [new Reference(Tokens::class)]);
-        self::controller($container, UserinfoController::class, [new Reference(Tokens::class)]);
+        self::controller($container, TokenController::class, [new Reference(Tokens::class), new Reference('router')]);
+        $container->registerForAutoconfiguration(ClaimsProvider::class)->addTag(self::CLAIMS_PROVIDER_TAG);
+        $container->register(UserClaims::class, UserClaims::class)->setArguments([new TaggedIteratorArgument(self::CLAIMS_PROVIDER_TAG)]);
+        self::controller($container, UserinfoController::class, [new Reference(Tokens::class), new Reference(UserClaims::class)]);
         self::controller($container, EndSessionController::class, [new Reference(Tokens::class), new Reference(ClientRegistry::class), new Reference(Pages::class), new Reference('security.helper')]);
 
+        if ($config['oidc']['backchannel_logout']['enabled']) {
+            if (!interface_exists(MessageBusInterface::class) || !interface_exists(HttpClientInterface::class)) {
+                throw new InvalidConfigurationException('"oidc.backchannel_logout" needs symfony/messenger and symfony/http-client: install them.');
+            }
+
+            $container->register(LogoutTokens::class, LogoutTokens::class)
+                ->setArguments([new Reference(SigningKeys::class), new Reference(ProviderSettings::class), $clock]);
+            $container->register(LogoutNotifier::class, MessengerLogoutNotifier::class)
+                ->setArguments([new Reference($config['oidc']['backchannel_logout']['bus'])]);
+            $container->register(SendLogoutTokenHandler::class, SendLogoutTokenHandler::class)
+                ->setArguments([new Reference(ClientRepository::class), new Reference(LogoutTokens::class), new Reference($config['oidc']['backchannel_logout']['http_client']), (float) $config['oidc']['backchannel_logout']['timeout']])
+                ->addTag('messenger.message_handler', ['handles' => SendLogoutToken::class]);
+        }
+
         if (class_exists(Command::class)) {
-            foreach ([CreateClientCommand::class, ListClientsCommand::class, DisableClientCommand::class] as $command) {
+            foreach ([CreateClientCommand::class, ListClientsCommand::class, DisableClientCommand::class, ReplaceClientKeysCommand::class] as $command) {
                 $container->register($command, $command)->setArguments([new Reference(ClientRegistry::class)])->addTag('console.command');
             }
 
@@ -564,7 +673,7 @@ final class IdentityProviderServices
         $optional = static fn (string $id): Reference => new Reference($id, ContainerInterface::NULL_ON_INVALID_REFERENCE);
 
         self::controller($container, AuthenticatorRouteController::class, []);
-        self::controller($container, AccountController::class, [$pages, new Reference(Accounts::class), new Reference(AccountLinks::class), new Reference(Modules::class), $config['registration']]);
+        self::controller($container, AccountController::class, [$pages, new Reference(Accounts::class), new Reference(AccountLinks::class), new Reference(Modules::class), $config['registration']['enabled'], $optional(self::REGISTRATION_LIMITER)]);
 
         if (\in_array(Modules::PASSKEYS, $modules, true)) {
             self::controller($container, PasskeyController::class, [$pages, new Reference(Passkeys::class)]);
@@ -575,7 +684,7 @@ final class IdentityProviderServices
         }
 
         if (\in_array(Modules::LOGIN_LINK, $modules, true)) {
-            self::controller($container, LoginLinkController::class, [$pages, new Reference(AccountRepository::class), new Reference(LoginLinkHandlerInterface::class), new Reference(Journal::class), $optional(AccountMailer::class)]);
+            self::controller($container, LoginLinkController::class, [$pages, new Reference(AccountRepository::class), new Reference(LoginLinkHandlerInterface::class), new Reference(Journal::class), $optional(AccountMailer::class), new Reference(LinkOrigin::class)]);
         }
 
         if (\in_array(Modules::SMS, $modules, true)) {

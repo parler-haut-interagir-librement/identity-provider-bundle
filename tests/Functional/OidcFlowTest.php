@@ -4,7 +4,12 @@ declare(strict_types=1);
 
 namespace Phil\IdentityProviderBundle\Tests\Functional;
 
+use Phil\IdentityProviderBundle\Application\AccountUser;
+use Phil\IdentityProviderBundle\Application\Jose\Jws;
+use Phil\IdentityProviderBundle\Application\Jose\PrivateKey;
+use Phil\IdentityProviderBundle\Application\Oidc\ClientAssertions;
 use Phil\IdentityProviderBundle\Application\Oidc\ClientRegistry;
+use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
 use Phil\IdentityProviderBundle\Domain\Oidc\Pkce;
 use Phil\IdentityProviderBundle\Infrastructure\Http\Oidc\AuthorizeController;
 use Phil\IdentityProviderBundle\Infrastructure\Http\Oidc\ClientCredentials;
@@ -142,6 +147,25 @@ final class OidcFlowTest extends FunctionalTestCase
         self::assertResponseRedirects('http://localhost/login');
     }
 
+    public function testASessionWithoutProofSignsInAgainForMaxAge(): void
+    {
+        $account = $this->account();
+        $this->service(ClientRegistry::class)->register('app', 'The App', ['https://app.example/cb'], firstParty: true);
+        $authorize = '/oidc/authorize?'.http_build_query(['response_type' => 'code', 'client_id' => 'app', 'redirect_uri' => 'https://app.example/cb', 'scope' => 'openid', 'state' => 'xyz', 'code_challenge' => Pkce::challengeOf(self::VERIFIER), 'code_challenge_method' => 'S256']);
+        // A token without proofs, as a session restored by remember_me holds.
+        $this->client->loginUser(new AccountUser($account));
+
+        $this->client->request('GET', $authorize.'&max_age=3600');
+        self::assertResponseRedirects();
+        self::assertStringStartsNotWith('https://app.example/cb', $this->location());
+
+        $this->client->request('GET', $authorize.'&max_age=3600&prompt=none');
+        self::assertResponseRedirects('https://app.example/cb?error=login_required&state=xyz&iss=http%3A%2F%2Flocalhost');
+
+        $this->client->request('GET', $authorize);
+        self::assertStringStartsWith('https://app.example/cb?code=', $this->location());
+    }
+
     public function testTheTokenEndpointRefusals(): void
     {
         [, $secret] = $this->service(ClientRegistry::class)->register('app', 'The App', ['https://app.example/cb']);
@@ -151,6 +175,10 @@ final class OidcFlowTest extends FunctionalTestCase
         self::assertResponseStatusCodeSame(401);
         self::assertSame('Basic realm="token"', $this->client->getResponse()->headers->get('WWW-Authenticate'));
         self::assertSame('invalid_client', $this->error());
+
+        $this->client->request('POST', '/oidc/token', ['grant_type' => 'authorization_code', 'code' => 'x', 'redirect_uri' => 'https://app.example/cb', 'code_verifier' => str_repeat('a', 4097), 'client_id' => 'app', 'client_secret' => $secret]);
+        self::assertResponseStatusCodeSame(400);
+        self::assertSame('invalid_request', $this->error());
 
         $this->client->request('POST', '/oidc/token', ['grant_type' => 'password', 'client_id' => 'app', 'client_secret' => $secret]);
         self::assertResponseStatusCodeSame(400);
@@ -236,6 +264,69 @@ final class OidcFlowTest extends FunctionalTestCase
         $this->client->request('GET', '/oidc/logout?client_id=app&post_logout_redirect_uri=https://evil.example');
         self::assertResponseIsSuccessful();
         self::assertSelectorTextContains('h1', 'You are signed out');
+    }
+
+    public function testAClientAssertionAndTheClientCredentialsGrant(): void
+    {
+        $key = PrivateKey::generate(SigningAlgorithm::ES256, 'k1');
+        $this->service(ClientRegistry::class)->register('machine', 'Machine', [], jwks: [$key->publicJwk()], resources: ['https://api.example/', 'https://other.example/']);
+        $now = time();
+        $assertion = static fn (array $claims = []): string => Jws::encode($claims + ['iss' => 'machine', 'sub' => 'machine', 'aud' => 'http://localhost/oidc/token', 'jti' => bin2hex(random_bytes(8)), 'exp' => $now + 60], $key);
+        $form = static fn (string $assertion, array $more = []): array => $more + ['grant_type' => 'client_credentials', 'resource' => 'https://api.example', 'client_assertion_type' => ClientAssertions::TYPE, 'client_assertion' => $assertion];
+
+        $this->client->request('POST', '/oidc/token', $form($assertion()));
+        self::assertResponseIsSuccessful();
+        $answer = $this->json();
+        self::assertSame(['access_token', 'token_type', 'expires_in'], array_keys($answer));
+        self::assertIsString($answer['access_token']);
+
+        $this->client->request('POST', '/oidc/introspect', ['token' => $answer['access_token'], 'client_assertion_type' => ClientAssertions::TYPE, 'client_assertion' => $assertion(['aud' => 'http://localhost'])]);
+        self::assertSame(['active' => true, 'client_id' => 'machine', 'sub' => 'machine', 'aud' => 'https://api.example/'], array_intersect_key($this->json(), ['active' => 1, 'client_id' => 1, 'sub' => 1, 'aud' => 1]));
+
+        $this->client->request('GET', '/oidc/userinfo', server: ['HTTP_AUTHORIZATION' => 'Bearer '.$answer['access_token']]);
+        self::assertResponseStatusCodeSame(401);
+
+        $used = $assertion();
+        $this->client->request('POST', '/oidc/token', $form($used));
+        $this->client->request('POST', '/oidc/token', $form($used));
+        self::assertSame('invalid_client', $this->error(), 'An assertion is used once.');
+
+        foreach ([
+            $form($assertion(), ['client_id' => 'other']),
+            $form($assertion(), ['client_assertion_type' => 'urn:other']),
+            $form($assertion(['aud' => 'http://evil.example/oidc/token'])),
+            $form('not-a-token'),
+            $form($assertion(['sub' => null])),
+            $form($assertion(), ['client_assertion' => ['x']]),
+            $form($assertion(), ['client_id' => ['machine']]),
+        ] as $refused) {
+            $this->client->request('POST', '/oidc/token', $refused);
+            self::assertSame('invalid_client', $this->error(), (string) json_encode($refused));
+        }
+
+        $this->client->request('POST', '/oidc/token', $form($assertion(), ['client_id' => 'machine', 'resource' => 'https://other.example']));
+        self::assertResponseIsSuccessful();
+
+        $this->client->request('POST', '/oidc/token', $form($assertion(), ['client_secret' => 'x']));
+        self::assertSame('invalid_request', $this->error());
+        $this->client->request('POST', '/oidc/token', $form($assertion()), server: ['HTTP_AUTHORIZATION' => 'Basic '.base64_encode('machine:x')]);
+        self::assertSame('invalid_request', $this->error());
+
+        foreach ([['resource' => 'https://unknown.example'], ['resource' => ['https://api.example', 'https://other.example']], ['resource' => ''], ['resource' => 'https://api.example/'.str_repeat('a', 2048)]] as $target) {
+            $this->client->request('POST', '/oidc/token', $form($assertion(), $target));
+            self::assertSame('invalid_target', $this->error(), (string) json_encode($target));
+        }
+
+        $this->client->request('POST', '/oidc/token', ['grant_type' => 'client_credentials', 'resource' => 'https://api.example/'.str_repeat('a', 2030), 'client_assertion_type' => ClientAssertions::TYPE, 'client_assertion' => $assertion()]);
+        self::assertSame('invalid_target', $this->error(), 'A resource of 2048 bytes at most is read, then refused as unknown.');
+
+        $this->client->request('GET', '/.well-known/openid-configuration');
+        $metadata = $this->json();
+        self::assertSame(['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'], $metadata['token_endpoint_auth_methods_supported']);
+        self::assertSame(['client_secret_basic', 'client_secret_post', 'private_key_jwt'], $metadata['introspection_endpoint_auth_methods_supported']);
+        self::assertSame(['RS256', 'ES256', 'EdDSA'], $metadata['token_endpoint_auth_signing_alg_values_supported']);
+        self::assertSame(['authorization_code', 'refresh_token', 'client_credentials'], $metadata['grant_types_supported']);
+        self::assertArrayNotHasKey('acr_values_supported', $metadata);
     }
 
     /**

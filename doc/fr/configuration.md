@@ -1,4 +1,4 @@
-<!-- phil-dev source-sha256=13ca7faecf4a2c1aa17d3e99291299f02247e1bb395cc607e07f70cb1365d6c6 -->
+<!-- phil-dev source-sha256=56aa0e8bff82c1c45e82c735259fa9a80670651d22df091b31053b21f3c1321c -->
 # Configuration
 
 La configuration du bundle se trouve sous `phil_identity_provider`. Chaque option a une valeur par défaut, sauf les
@@ -10,6 +10,7 @@ fournisseur.
 phil_identity_provider:
     secret: '%env(IDENTITY_SECRET)%'
     site_name: Example
+    public_origin: 'https://example.com'
     modules:
         accounts: true          # always on
         password: true
@@ -45,7 +46,12 @@ phil_identity_provider:
 | `clock` | `clock` | Identifiant de service de l'horloge PSR-20. |
 | `layout` | `@PhilIdentityProvider/layout.html.twig` | Le gabarit que les pages étendent. |
 | `kit_subdirectory` | `null` | L'emplacement des recettes du kit ; le sous-répertoire de `ux_toolkit` quand la valeur est nulle. |
-| `registration` | `true` | Si n'importe qui peut s'inscrire. |
+| `public_origin` | `null` | L'adresse canonique du site, comme `https://example.com`, sur laquelle mènent les liens envoyés par courriel. Nulle, elle prend l'hôte de la requête, que `framework.trusted_hosts` doit alors borner : dans l'environnement `prod`, le bundle refuse de démarrer quand ni l'un ni l'autre n'est réglé. Voir [Où mènent les liens](accounts.md#où-mènent-les-liens). |
+| `registration.enabled` | `true` | Si n'importe qui peut s'inscrire ; `registration: false` la ferme. |
+| `registration.rate_limit.enabled` | `true` | Limite l'inscription et les courriels de vérification ; `rate_limit: false` désactive les limites. Voir [Limiter les inscriptions](accounts.md#limiter-les-inscriptions). |
+| `registration.rate_limit.per_ip.limit`, `.interval` | `10`, `1 hour` | Les inscriptions par adresse de client, ou par réseau IPv6 /64, à chaque intervalle. |
+| `registration.rate_limit.per_address.limit`, `.interval` | `5`, `1 hour` | Les inscriptions par adresse saisie, connue ou non, à chaque intervalle. |
+| `registration.rate_limit.resend_delay` | `5 minutes` | Le délai avant qu'un autre courriel de vérification aille à la même adresse. |
 | `require_verified_email` | `false` | Si un compte ne se connecte qu'une fois son adresse vérifiée. |
 | `login_route` | `null` | La route du formulaire de connexion, proposée pour une réauthentification par mot de passe et après l'échec d'une connexion externe. |
 | `default_target` | `/` | Où mène une connexion par les authentificateurs du bundle quand rien n'a demandé de page. |
@@ -118,6 +124,21 @@ phil_identity_provider:
 | `oidc.retired_key_retention` | `604800` | Secondes pendant lesquelles une clé retirée reste publiée. |
 | `oidc.allow_localhost` | `false` | Si les adresses de redirection sur `localhost` en http sont acceptées, pour le développement. |
 | `oidc.lock_factory` | `lock.factory` | Le service `LockFactory` qui sérialise la première clé de signature et chaque rotation ; son magasin doit être partagé par tous les serveurs. |
+| `oidc.extra_scopes` | `[]` | Les portées, outre `openid`, `profile`, `email`, `phone` et `offline_access`, que les clients peuvent enregistrer, comme les portées d'une ressource. |
+| `oidc.client_authentication.methods` | les quatre | Les méthodes par lesquelles les clients peuvent s'authentifier : `client_secret_basic`, `client_secret_post`, `private_key_jwt`, `none`. Voir [Authentification des clients](oidc-provider.md#authentification-des-clients). |
+| `oidc.client_authentication.clock_skew` | `60` | Secondes dont une heure d'une assertion de client peut être décalée, de 0 à 300. |
+| `oidc.client_authentication.assertion_max_lifetime` | `300` | Le plus loin devant, en secondes, que peut être l'expiration d'une assertion de client, de 1 à 3600 ; son `jti` est gardé aussi longtemps. |
+| `oidc.refresh_token_bound_to_session` | `true` | Si un jeton d'actualisation émis dans une session est refusé une fois la session fermée ou plus vieille que `oidc.session_max_age`, sa famille révoquée. |
+| `oidc.session_max_age` | `null` | Secondes après l'ouverture d'une session au-delà desquelles ses jetons d'actualisation ne sont plus émis ni acceptés ; null pour aucune borne que la fin de la session. |
+| `oidc.id_token.acr` | `null` | L'`acr` de chaque jeton d'identité ; null pour aucun. |
+| `oidc.id_token.idp` | `null` | L'`idp` de chaque jeton d'identité ; null pour aucun. |
+| `oidc.id_token.session_start` | `false` | Si le jeton d'identité porte `session_start`, l'ouverture de sa session. |
+| `oidc.subject.type` | `account` | Le `sub` d'un compte : `account` pour son identifiant interne, `public` pour un identifiant opaque le même pour tous les clients, `pairwise` pour un par secteur. Voir [Jetons](oidc-provider.md#jetons). |
+| `oidc.subject.salt` | `null` | Le secret, de 32 octets au moins, sous lequel les sujets opaques et par paire sont dérivés ; exigé par `public` et `pairwise`, et jamais changé une fois que les clients ont vu des sujets. |
+| `oidc.backchannel_logout.enabled` | `false` | Si les clients qui ont enregistré une adresse de déconnexion par canal arrière reçoivent un jeton de déconnexion quand prend fin une session dont ils ont des jetons ; exige `symfony/messenger` et `symfony/http-client`. Voir [Déconnexion par canal arrière](oidc-provider.md#déconnexion-par-canal-arrière). |
+| `oidc.backchannel_logout.bus` | `messenger.default_bus` | Le bus de messages de `SendLogoutToken`. |
+| `oidc.backchannel_logout.http_client` | `http_client` | Le client HTTP qui poste les jetons de déconnexion. |
+| `oidc.backchannel_logout.timeout` | `5` | Secondes dont dispose un client pour répondre, de 1 à 30. |
 
 ## Un site qui refuse certaines méthodes
 

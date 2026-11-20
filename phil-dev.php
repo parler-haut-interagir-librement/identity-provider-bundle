@@ -69,10 +69,12 @@ return [
                     '\\$this->grants\\?->saveToken\\(\\$token\\);',
                 ],
             ],
-            // The three parts of an attested credential are all read or none is.
+            // The three parts of an attested credential are all read or none is. Messenger and the HTTP client are both
+            // installed or both absent in a test run: a test cannot make one of them vanish.
             'LogicalOr' => [
                 'ignoreSourceCodeByRegex' => [
                     'if \\(null === \\$data->credentialId.*',
+                    'if \\(!interface_exists\\(MessageBusInterface::class\\) \\|\\| !interface_exists\\(HttpClientInterface::class\\)\\) \\{',
                 ],
             ],
             // A value is read at the same depth as its key, and the key is checked first.
@@ -81,6 +83,9 @@ return [
                     '\\$values\\[\\$key\\] = \\$this->item\\(\\$depth \\+ 1\\);',
                     // `trim()` takes the space that the shorter prefix leaves.
                     '\\$parts = explode\\(\':\', sodium_base642bin\\(trim\\(substr.*',
+                    // A text that PHP cannot read as a duration counts as zero seconds; -1 is refused as 0 is, with the
+                    // same message.
+                    '\\$seconds = 0;',
                 ],
             ],
             'Plus' => [

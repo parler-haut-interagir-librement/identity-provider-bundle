@@ -7,14 +7,21 @@ namespace Phil\IdentityProviderBundle;
 use Override;
 use Phil\IdentityProviderBundle\Application\AccountUser;
 use Phil\IdentityProviderBundle\Application\Modules;
+use Phil\IdentityProviderBundle\Application\Oidc\ProviderSettings;
 use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
+use Phil\IdentityProviderBundle\Domain\Oidc\ClientAuthMethod;
+use Phil\IdentityProviderBundle\Domain\Oidc\SubjectType;
 use Phil\IdentityProviderBundle\Infrastructure\DependencyInjection\IdentityProviderServices;
 use Phil\IdentityProviderBundle\Infrastructure\DependencyInjection\KitSubdirectoryPass;
+use Phil\IdentityProviderBundle\Infrastructure\Routing\RouterLinkOrigin;
 use Phil\RateLimit\RateLimitGuard;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\HttpFoundation\Request;
 
 /**
  * An open identity brick, one module per method, each with its routes, tables and pages:
@@ -67,7 +74,22 @@ final class PhilIdentityProviderBundle extends AbstractBundle
             ->scalarNode('clock')->info('Service id of the PSR-20 clock.')->defaultValue('clock')->cannotBeEmpty()->end()
             ->scalarNode('layout')->info('The template the pages extend.')->defaultValue('@PhilIdentityProvider/layout.html.twig')->cannotBeEmpty()->end()
             ->scalarNode('kit_subdirectory')->info('Where the recipes of the kit are, under the components directory; the subdirectory of ux_toolkit when null.')->defaultNull()->end()
-            ->booleanNode('registration')->info('Whether anyone may register.')->defaultTrue()->end()
+            ->scalarNode('public_origin')->info('The canonical address of the site, such as https://example.com, that the links sent by email point to; null takes the host of the request, which framework.trusted_hosts must then bound. In the prod environment, the bundle refuses to boot when neither is set.')->defaultNull()->end()
+            ->arrayNode('registration')
+                ->info('Whether anyone may register, and how often; "registration: false" closes it.')
+                ->canBeDisabled()
+                ->children()
+                    ->arrayNode('rate_limit')
+                        ->info('The limits of registration, per client and per address typed, and the delay before another verification email goes to one address; "rate_limit: false" turns them off.')
+                        ->canBeDisabled()
+                        ->children()
+                            ->append($this->limit('per_ip', 'The registrations per client address, or IPv6 /64 network, in each interval.', 10, '1 hour'))
+                            ->append($this->limit('per_address', 'The registrations per address typed, known or not, in each interval.', 5, '1 hour'))
+                            ->scalarNode('resend_delay')->info('The delay before another verification email goes to the same address, in the format of the Rate Limiter component.')->defaultValue('5 minutes')->cannotBeEmpty()->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end()
             ->booleanNode('require_verified_email')->info('Whether an account signs in only once its address is verified.')->defaultFalse()->end()
             ->scalarNode('login_route')->info('The route of the sign-in form of the firewall, offered for a re-authentication by password and after a failed external sign-in.')->defaultNull()->end()
             ->scalarNode('default_target')->info('Where a sign-in by the bundle goes when nothing asked for a page.')->defaultValue('/')->cannotBeEmpty()->end()
@@ -173,6 +195,54 @@ final class PhilIdentityProviderBundle extends AbstractBundle
                     ->integerNode('retired_key_retention')->info('The seconds a retired key stays published.')->defaultValue(604_800)->min(0)->end()
                     ->booleanNode('allow_localhost')->info('Whether redirect addresses on localhost over http are accepted, for development.')->defaultFalse()->end()
                     ->scalarNode('lock_factory')->info('The LockFactory service that serializes the first signing key and each rotation; its store must be shared by every server.')->defaultValue('lock.factory')->cannotBeEmpty()->end()
+                    ->arrayNode('extra_scopes')
+                        ->info('Scopes besides openid, profile, email, phone and offline_access that clients may register, such as the scopes of a resource asked by the client_credentials grant.')
+                        ->scalarPrototype()
+                            ->validate()->ifTrue(static fn (mixed $scope): bool => !\is_string($scope) || 1 !== preg_match('/^[\x21\x23-\x5b\x5d-\x7e]{1,64}$/D', $scope) || \in_array($scope, ProviderSettings::SCOPES, true))->thenInvalid('A scope is 1 to 64 printable characters without a space, a quote or a backslash, and not one the provider knows already: %s.')->end()
+                        ->end()
+                    ->end()
+                    ->arrayNode('client_authentication')
+                        ->info('How clients may authenticate at the token, revocation and introspection endpoints.')
+                        ->addDefaultsIfNotSet()
+                        ->children()
+                            ->arrayNode('methods')
+                                ->info('The methods accepted; leave out client_secret_basic and client_secret_post to accept only client assertions (private_key_jwt) and public clients.')
+                                ->defaultValue(ClientAuthMethod::values())
+                                ->requiresAtLeastOneElement()
+                                ->enumPrototype()->values(ClientAuthMethod::values())->end()
+                            ->end()
+                            ->integerNode('clock_skew')->info('The seconds a time of a client assertion may be off.')->defaultValue(60)->min(0)->max(300)->end()
+                            ->integerNode('assertion_max_lifetime')->info('The furthest ahead, in seconds, the expiry of a client assertion may be; its jti is kept that long.')->defaultValue(300)->min(1)->max(3600)->end()
+                        ->end()
+                    ->end()
+                    ->booleanNode('refresh_token_bound_to_session')->info('Whether a refresh token issued in a session is refused once the session is closed or older than session_max_age, its family revoked.')->defaultTrue()->end()
+                    ->integerNode('session_max_age')->info('The seconds after a session opened past which its refresh tokens are no longer issued nor accepted; null for no bound but the end of the session.')->defaultNull()->min(1)->end()
+                    ->arrayNode('id_token')
+                        ->info('The optional claims of the ID token.')
+                        ->addDefaultsIfNotSet()
+                        ->children()
+                            ->scalarNode('acr')->info('The authentication context class reference of every ID token, such as a level the network agreed on; null for none.')->defaultNull()->end()
+                            ->scalarNode('idp')->info('The identity provider every ID token names, such as the identifier of the network; null for none.')->defaultNull()->end()
+                            ->booleanNode('session_start')->info('Whether the ID token carries session_start, the time its session opened.')->defaultFalse()->end()
+                        ->end()
+                    ->end()
+                    ->arrayNode('subject')
+                        ->info('The sub of an account for its clients.')
+                        ->addDefaultsIfNotSet()
+                        ->children()
+                            ->enumNode('type')->info('"account" for the internal identifier, "public" for an opaque identifier the same for every client, "pairwise" for one per sector of client.')->values(array_map(static fn (SubjectType $type): string => $type->value, SubjectType::cases()))->defaultValue(SubjectType::Account->value)->end()
+                            ->scalarNode('salt')->info('The secret, at least 32 bytes, from the secrets vault, that opaque and pairwise subjects are derived under; it never changes once clients have seen subjects.')->defaultNull()->end()
+                        ->end()
+                    ->end()
+                    ->arrayNode('backchannel_logout')
+                        ->info('Logout tokens posted to the clients that registered a back-channel logout address when a session they have tokens of ends, through Messenger; needs symfony/messenger and symfony/http-client.')
+                        ->canBeEnabled()
+                        ->children()
+                            ->scalarNode('bus')->info('The message bus of the logout tokens; route SendLogoutToken to an asynchronous transport, whose retries try a client again.')->defaultValue('messenger.default_bus')->cannotBeEmpty()->end()
+                            ->scalarNode('http_client')->info('The HTTP client that posts the logout tokens.')->defaultValue('http_client')->cannotBeEmpty()->end()
+                            ->integerNode('timeout')->info('The seconds a client has to answer.')->defaultValue(5)->min(1)->max(30)->end()
+                        ->end()
+                    ->end()
                 ->end()
             ->end()
             ->arrayNode('secrets')
@@ -186,6 +256,28 @@ final class PhilIdentityProviderBundle extends AbstractBundle
             ->end()
             ->scalarNode('audit')->info('"auto" writes to phil/audit-bundle when it is installed, "none" nowhere, or the id of an AuditRecorder.')->defaultValue('auto')->cannotBeEmpty()->end()
         ->end();
+    }
+
+    /**
+     * Refuses to boot, in the `prod` environment, when the links sent by email would take the host of the request: no
+     * `public_origin` and no `framework.trusted_hosts`. The origin is read here, once its environment variable is known.
+     */
+    #[Override]
+    public function boot(): void
+    {
+        // Unset until the kernel gives the container, which it does before booting a bundle.
+        $container = $this->container ?? null;
+
+        if (!$container instanceof ContainerInterface || true !== $container->getParameter('phil_identity_provider.enabled')) {
+            return;
+        }
+
+        $origin = $container->getParameter(IdentityProviderServices::PUBLIC_ORIGIN);
+        $origin = \is_string($origin) && '' !== $origin ? $origin : null;
+
+        $environment = $container->getParameter('kernel.environment');
+        RouterLinkOrigin::origin($origin, true === $container->getParameter('kernel.debug'));
+        RouterLinkOrigin::assertBound($origin, \is_string($environment) ? $environment : '', Request::getTrustedHosts());
     }
 
     #[Override]
@@ -240,8 +332,22 @@ final class PhilIdentityProviderBundle extends AbstractBundle
         }
 
         unset($config['enabled']);
-        /** @phpstan-var array{secret: string, site_name: string, modules: array<string, bool>, store: string, entity_manager: string, clock: string, layout: string, kit_subdirectory: ?string, registration: bool, require_verified_email: bool, login_route: ?string, default_target: string, open_routes: list<string>, mailer: array{from: ?string}, password: array{min_score: int<0, 4>, breach_check: bool, http_client: string}, lockout: array{threshold: positive-int, base: positive-int, max: positive-int}, login_limiter: array{enabled: bool, max_attempts: positive-int, network_max_attempts: positive-int, account_max_attempts: positive-int, interval: string, cache_pool: string, lock_factory: ?string, single_server: bool}, links: array{verify_lifetime: positive-int, reset_lifetime: positive-int}, passkeys: array{rp_id: ?string, rp_name: ?string, origins: list<string>, require_user_verification: bool}, totp: array{issuer: ?string, window: int<0, 10>}, sms: array{sender: ?string, from: string, message: string, lifetime: positive-int, attempts: positive-int}, step_up: array{attribute: string, lifetime: positive-int}, sessions: array{touch_interval: non-negative-int}, external: array{link_verified_email: bool, register: bool}, oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string}, secrets: array{kms_key: ?string, allow_plaintext_secrets: bool, encrypter: string, decrypter: string}, audit: string} $config */
+        /** @phpstan-var array{secret: string, site_name: string, modules: array<string, bool>, store: string, entity_manager: string, clock: string, layout: string, kit_subdirectory: ?string, registration: array{enabled: bool, rate_limit: array{enabled: bool, per_ip: array{limit: positive-int, interval: string}, per_address: array{limit: positive-int, interval: string}, resend_delay: string}}, public_origin: ?string, require_verified_email: bool, login_route: ?string, default_target: string, open_routes: list<string>, mailer: array{from: ?string}, password: array{min_score: int<0, 4>, breach_check: bool, http_client: string}, lockout: array{threshold: positive-int, base: positive-int, max: positive-int}, login_limiter: array{enabled: bool, max_attempts: positive-int, network_max_attempts: positive-int, account_max_attempts: positive-int, interval: string, cache_pool: string, lock_factory: ?string, single_server: bool}, links: array{verify_lifetime: positive-int, reset_lifetime: positive-int}, passkeys: array{rp_id: ?string, rp_name: ?string, origins: list<string>, require_user_verification: bool}, totp: array{issuer: ?string, window: int<0, 10>}, sms: array{sender: ?string, from: string, message: string, lifetime: positive-int, attempts: positive-int}, step_up: array{attribute: string, lifetime: positive-int}, sessions: array{touch_interval: non-negative-int}, external: array{link_verified_email: bool, register: bool}, oidc: array{issuer: ?string, algorithm: string, code_lifetime: positive-int, access_token_lifetime: positive-int, id_token_lifetime: positive-int, refresh_token_lifetime: positive-int, key_activation_delay: non-negative-int, retired_key_retention: non-negative-int, allow_localhost: bool, lock_factory: string, extra_scopes: list<string>, client_authentication: array{methods: non-empty-list<string>, clock_skew: int<0, 300>, assertion_max_lifetime: int<1, 3600>}, refresh_token_bound_to_session: bool, session_max_age: ?positive-int, id_token: array{acr: ?string, idp: ?string, session_start: bool}, subject: array{type: string, salt: ?string}, backchannel_logout: array{enabled: bool, bus: string, http_client: string, timeout: positive-int}}, secrets: array{kms_key: ?string, allow_plaintext_secrets: bool, encrypter: string, decrypter: string}, audit: string} $config */
         IdentityProviderServices::register($builder, $config);
+    }
+
+    /**
+     * A count of the Rate Limiter component: how many in each interval.
+     */
+    private function limit(string $name, string $info, int $limit, string $interval): ArrayNodeDefinition
+    {
+        return new ArrayNodeDefinition($name)
+            ->info($info)
+            ->addDefaultsIfNotSet()
+            ->children()
+                ->integerNode('limit')->defaultValue($limit)->min(1)->end()
+                ->scalarNode('interval')->info('The window of the count, in the format of the Rate Limiter component.')->defaultValue($interval)->cannotBeEmpty()->end()
+            ->end();
     }
 
     /**

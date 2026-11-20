@@ -81,7 +81,7 @@ final class ContainerSnapshotTest extends TestCase
             'clock' => 'app.clock',
             'modules' => ['passkeys' => true, 'totp' => true, 'recovery_codes' => true, 'login_link' => true, 'sms' => true, 'external' => true, 'oidc' => true],
             'passkeys' => ['rp_id' => 'example.com', 'origins' => ['https://example.com', 'https://app.example.com']],
-            'oidc' => ['issuer' => 'https://example.com', 'code_lifetime' => 120, 'access_token_lifetime' => 300, 'id_token_lifetime' => 200, 'refresh_token_lifetime' => 1000, 'key_activation_delay' => 10, 'retired_key_retention' => 20],
+            'oidc' => ['issuer' => 'https://example.com', 'code_lifetime' => 120, 'access_token_lifetime' => 300, 'id_token_lifetime' => 200, 'refresh_token_lifetime' => 1000, 'key_activation_delay' => 10, 'retired_key_retention' => 20, 'extra_scopes' => ['events:read', 'events:read'], 'client_authentication' => ['methods' => ['private_key_jwt', 'none', 'none'], 'clock_skew' => 30, 'assertion_max_lifetime' => 120], 'refresh_token_bound_to_session' => false, 'session_max_age' => 43200, 'id_token' => ['acr' => 'urn:example:loa:2', 'idp' => 'https://network.example', 'session_start' => true], 'subject' => ['type' => 'pairwise', 'salt' => '%env(IDENTITY_SUBJECT_SALT)%'], 'backchannel_logout' => ['bus' => 'app.bus', 'http_client' => 'app.http', 'timeout' => 3]],
             'external' => ['link_verified_email' => true, 'register' => false],
             'totp' => ['issuer' => 'Example', 'window' => 2],
             'lockout' => ['threshold' => 3, 'base' => 30, 'max' => 120],
@@ -92,6 +92,8 @@ final class ContainerSnapshotTest extends TestCase
             'layout' => 'base.html.twig',
             'secret' => 'a-secret-of-at-least-32-characters-long',
             'secrets' => ['kms_key' => 'identity', 'encrypter' => 'app.encrypter', 'decrypter' => 'app.decrypter'],
+            'public_origin' => 'https://accounts.example.com',
+            'registration' => ['rate_limit' => ['per_ip' => ['limit' => 3, 'interval' => '10 minutes'], 'per_address' => ['limit' => 2, 'interval' => '1 day'], 'resend_delay' => '2 minutes']],
         ], true];
 
         yield 'second-factors-and-oidc-only' => ['second-factors-and-oidc-only', [
@@ -100,6 +102,7 @@ final class ContainerSnapshotTest extends TestCase
             'oidc' => ['issuer' => 'https://example.com'],
             'secrets' => ['allow_plaintext_secrets' => true],
             'audit' => 'none',
+            'registration' => ['rate_limit' => false],
         ], false];
 
         yield 'audit-auto-with-the-trail' => ['audit-auto-with-the-trail', ['store' => 'memory'], true];
