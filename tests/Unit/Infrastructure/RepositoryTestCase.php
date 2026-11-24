@@ -5,18 +5,31 @@ declare(strict_types=1);
 namespace Phil\IdentityProviderBundle\Tests\Unit\Infrastructure;
 
 use DateTimeImmutable;
+use DateTimeZone;
 use Phil\IdentityProviderBundle\Application\Contract\Transactions;
+use Phil\IdentityProviderBundle\Application\Exception\OAuthError;
+use Phil\IdentityProviderBundle\Application\Oidc\Authorization;
+use Phil\IdentityProviderBundle\Application\Oidc\ClientRegistry;
+use Phil\IdentityProviderBundle\Application\Oidc\ProviderSettings;
+use Phil\IdentityProviderBundle\Application\Oidc\SigningKeys;
+use Phil\IdentityProviderBundle\Application\Oidc\Tokens;
+use Phil\IdentityProviderBundle\Domain\Account\AccountState;
+use Phil\IdentityProviderBundle\Domain\Account\AddressPurpose;
+use Phil\IdentityProviderBundle\Domain\Contract\AccountAddressRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\AccountRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\AccountSessionRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\ClientRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\GrantRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\LinkedIdentityRepository;
+use Phil\IdentityProviderBundle\Domain\Contract\LinkTokenRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\PasskeyRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\SecondFactorRepository;
 use Phil\IdentityProviderBundle\Domain\Contract\SigningKeyRepository;
 use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
 use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
+use Phil\IdentityProviderBundle\Domain\Model\Account\AccountAddress;
 use Phil\IdentityProviderBundle\Domain\Model\External\LinkedIdentity;
+use Phil\IdentityProviderBundle\Domain\Model\Link\LinkToken;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\AuthorizationCode;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\Client;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\Consent;
@@ -27,10 +40,17 @@ use Phil\IdentityProviderBundle\Domain\Model\Passkey\Passkey;
 use Phil\IdentityProviderBundle\Domain\Model\Session\AccountSession;
 use Phil\IdentityProviderBundle\Domain\Model\Totp\RecoveryCodeSet;
 use Phil\IdentityProviderBundle\Domain\Model\Totp\TotpCredential;
+use Phil\IdentityProviderBundle\Domain\Oidc\Pkce;
 use Phil\IdentityProviderBundle\Domain\Oidc\TokenKind;
 use Phil\IdentityProviderBundle\Domain\WebAuthn\RegisteredCredential;
+use Phil\IdentityProviderBundle\Infrastructure\Secret\PlainSecretCipher;
+use Phil\IdentityProviderBundle\Tests\Unit\Fixture\InterleavedGrants;
+use Phil\IdentityProviderBundle\Tests\Unit\Fixture\Query;
+use Phil\IdentityProviderBundle\Tests\Unit\Fixture\Services;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\Store\InMemoryStore;
 
 /**
  * What every store keeps and reads back, the same in memory and in each database: the rows written, read again once
@@ -41,6 +61,8 @@ abstract class RepositoryTestCase extends TestCase
     protected const string ADA = '01JCZ6Q7Y3W0000000000000AA';
 
     protected const string BOB = '01JCZ6Q7Y3W0000000000000BB';
+
+    private const string VERIFIER = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
 
     abstract protected function accounts(): AccountRepository;
 
@@ -59,6 +81,10 @@ abstract class RepositoryTestCase extends TestCase
     abstract protected function keys(): SigningKeyRepository;
 
     abstract protected function transactions(): Transactions;
+
+    abstract protected function addresses(): AccountAddressRepository;
+
+    abstract protected function linkTokens(): LinkTokenRepository;
 
     /**
      * Forgets what the store holds in memory, so that the next read comes from its storage.
@@ -294,6 +320,118 @@ abstract class RepositoryTestCase extends TestCase
         self::assertNull($this->grants()->code(AuthorizationCode::idOf('code')));
         self::assertNull($this->grants()->token('jti-2'));
         self::assertNotNull($this->grants()->token(IssuedToken::idOfRefresh('r')));
+    }
+
+    public function testARevokedFamilyIsMarkedAndCatchesTheTokensSavedAfterIt(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $family = 'FAMILY0000000000000000000A';
+        $this->grants()->saveToken(IssuedToken::issue('jti-1', TokenKind::Access, $family, 'app', self::ADA, [], null, $now, [], $now, $now->modify('+10 minutes')));
+        $this->grants()->saveToken(IssuedToken::issue('jti-2', TokenKind::Access, 'FAMILY0000000000000000000B', 'app', self::ADA, [], null, $now, [], $now, $now->modify('+10 minutes')));
+        self::assertFalse($this->grants()->isFamilyRevoked($family));
+
+        $this->grants()->revokeFamily($family, $now, $now->modify('+30 days'));
+        $this->clear();
+        self::assertTrue($this->grants()->isFamilyRevoked($family));
+        self::assertFalse($this->grants()->isFamilyRevoked('FAMILY0000000000000000000B'));
+        self::assertFalse($this->grants()->isFamilyRevoked(strtolower($family)), 'The family compares byte by byte.');
+        self::assertTrue($this->grants()->token('jti-1')?->isRevoked());
+        self::assertFalse($this->grants()->token('jti-2')?->isRevoked());
+
+        // The request that won saves its tokens after the revocation, reads the mark, and revokes the family again.
+        $this->grants()->saveToken(IssuedToken::issue('jti-3', TokenKind::Access, $family, 'app', self::ADA, [], null, $now, [], $now->modify('+1 second'), $now->modify('+10 minutes')));
+        self::assertTrue($this->grants()->isFamilyRevoked($family));
+        $this->grants()->revokeFamily($family, $now->modify('+1 second'), $now->modify('+31 days'));
+        $this->clear();
+        self::assertSame(['jti-2'], $this->idsOf($this->grants()->activeFor(self::ADA, 'app')));
+
+        self::assertSame(3, $this->grants()->purge($now->modify('+11 minutes')), 'The three tokens expired; the mark is kept.');
+        self::assertTrue($this->grants()->isFamilyRevoked($family));
+        self::assertSame(0, $this->grants()->purge($now->modify('+30 days')));
+        self::assertSame(1, $this->grants()->purge($now->modify('+30 days +1 second')), 'The first mark is kept, not the one of the second revocation.');
+        self::assertFalse($this->grants()->isFamilyRevoked($family));
+    }
+
+    public function testARefreshReplayedBetweenTheRotationAndTheSaveLeavesNoTokenOfTheFamilyActive(): void
+    {
+        [$tokens, $grants, $client, $code, $services] = $this->provider();
+        $response = $tokens->exchangeCode($client, $code, 'https://app.example/cb', self::VERIFIER);
+        $refresh = (string) $response['refresh_token'];
+        $family = $grants->token(IssuedToken::idOfRefresh($refresh))?->family() ?? '';
+        $loser = null;
+        $grants->afterUse = static function () use ($tokens, $client, $refresh, &$loser): void {
+            try {
+                $tokens->refresh($client, $refresh, null);
+            } catch (OAuthError $oAuthError) {
+                $loser = $oAuthError->error;
+            }
+        };
+
+        try {
+            $tokens->refresh($client, $refresh, null);
+            self::fail('The request that rotated the token keeps tokens of a revoked family.');
+        } catch (OAuthError $oAuthError) {
+            self::assertSame('invalid_grant', $oAuthError->error);
+        }
+
+        self::assertSame('invalid_grant', $loser);
+        $this->clear();
+        self::assertNotSame('', $family);
+        self::assertSame([], $this->activeIn($family, $services->clock->now()));
+    }
+
+    public function testACodeReplayedBetweenItsUseAndTheSaveLeavesNoTokenOfTheFamilyActive(): void
+    {
+        [$tokens, $grants, $client, $code, $services] = $this->provider();
+        $family = $grants->code(AuthorizationCode::idOf($code))?->family() ?? '';
+        $loser = null;
+        $grants->afterUse = static function () use ($tokens, $client, $code, &$loser): void {
+            try {
+                $tokens->exchangeCode($client, $code, 'https://app.example/cb', self::VERIFIER);
+            } catch (OAuthError $oAuthError) {
+                $loser = $oAuthError->error;
+            }
+        };
+
+        try {
+            $tokens->exchangeCode($client, $code, 'https://app.example/cb', self::VERIFIER);
+            self::fail('The request that used the code keeps tokens of a revoked family.');
+        } catch (OAuthError $oAuthError) {
+            self::assertSame('invalid_grant', $oAuthError->error);
+        }
+
+        self::assertSame('invalid_grant', $loser);
+        $this->clear();
+        self::assertNotSame('', $family);
+        self::assertSame([], $this->activeIn($family, $services->clock->now()));
+    }
+
+    public function testInstantsAreWrittenAndReadInUtcWhateverTheTimeZoneOfTheProcess(): void
+    {
+        $zone = date_default_timezone_get();
+
+        try {
+            date_default_timezone_set('America/Toronto');
+            // 01:30 happens twice in Toronto on 2026-11-01: first in daylight time, then an hour later in standard time.
+            $daylight = new DateTimeImmutable('@1793511000')->setTimezone(new DateTimeZone('America/Toronto'));
+            $standard = new DateTimeImmutable('@1793514600')->setTimezone(new DateTimeZone('America/Toronto'));
+            self::assertSame($daylight->format('Y-m-d H:i'), $standard->format('Y-m-d H:i'));
+            $this->grants()->saveToken(
+                IssuedToken::issue('jti-d', TokenKind::Access, 'FAMILY0000000000000000000A', 'app', self::ADA, [], null, $daylight, [], $daylight, $daylight),
+                IssuedToken::issue('jti-s', TokenKind::Access, 'FAMILY0000000000000000000A', 'app', self::ADA, [], null, $standard, [], $standard, $standard),
+            );
+            $this->clear();
+
+            date_default_timezone_set('UTC');
+            self::assertSame($daylight->format('U.u'), $this->grants()->token('jti-d')?->expiresAt()->format('U.u'));
+            self::assertSame($standard->format('U.u'), $this->grants()->token('jti-s')?->expiresAt()->format('U.u'));
+            self::assertSame(1, $this->grants()->purge(new DateTimeImmutable('@1793512800')), 'Only the token expired in daylight time is past.');
+            $this->clear();
+            self::assertNull($this->grants()->token('jti-d'));
+            self::assertNotNull($this->grants()->token('jti-s'));
+        } finally {
+            date_default_timezone_set($zone);
+        }
     }
 
     public function testACodeIsUsedOnceAndARefreshTokenRotatedOnce(): void
@@ -597,6 +735,86 @@ abstract class RepositoryTestCase extends TestCase
         self::assertNotNull($this->grants()->code(AuthorizationCode::idOf('late')));
     }
 
+    public function testAnAccountIsFoundByItsCanonicalAddressAndKeepsItsState(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $uuid = '0192f5b4-7c1e-7a3b-9f00-123456789abc';
+        $account = Account::register($uuid, 'ada+news@example.com', $now, null, 'ada@example.com');
+        $account->changeState(AccountState::Suspended, $now->modify('+1 hour'));
+        $this->accounts()->save($account, Account::register(self::BOB, 'bob@example.com', $now));
+        $this->sessions()->save(AccountSession::open(str_repeat('u', 43), $uuid, 'Device', [], false, $now));
+        $this->clear();
+
+        $found = $this->accounts()->findByCanonicalEmail('ada@example.com');
+        self::assertSame($uuid, $found?->id());
+        self::assertSame('ada+news@example.com', $found->email());
+        self::assertSame(AccountState::Suspended, $found->state());
+        self::assertSame($now->modify('+1 hour')->getTimestamp(), $found->stateChangedAt()?->getTimestamp());
+        self::assertSame(AccountState::Active, $this->accounts()->get(self::BOB)?->state());
+        self::assertNull($this->accounts()->findByCanonicalEmail('ada+news@example.com'));
+        self::assertSame($uuid, $this->sessions()->openFor($uuid)[0]->accountId());
+    }
+
+    public function testAccountAddresses(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $recovery = AccountAddress::add(self::ADA, AddressPurpose::Recovery, 'ada@example.org', 'ada@example.org', $now);
+        $notices = AccountAddress::add(self::ADA, AddressPurpose::Notices, 'Ada+News@example.net', 'ada@example.net', $now);
+        $this->addresses()->save($recovery, $notices, AccountAddress::add(self::BOB, AddressPurpose::Recovery, 'bob@example.org', 'bob@example.org', $now));
+        $this->clear();
+
+        $found = $this->addresses()->forAccount(self::ADA);
+        self::assertSame([AddressPurpose::Notices, AddressPurpose::Recovery], array_map(static fn (AccountAddress $address): AddressPurpose => $address->purpose(), $found));
+        self::assertSame(['ada+news@example.net', 'ada@example.net', false], [$found[0]->address(), $found[0]->canonical(), $found[0]->isVerified()]);
+        self::assertSame(self::ADA, $this->addresses()->findByCanonical(AddressPurpose::Notices, 'ada@example.net')?->accountId());
+        self::assertNull($this->addresses()->findByCanonical(AddressPurpose::Recovery, 'ada@example.net'));
+        self::assertSame(self::BOB, $this->addresses()->findByCanonical(AddressPurpose::Recovery, 'bob@example.org')?->accountId());
+        self::assertSame([], $this->addresses()->forAccount('nobody'));
+
+        $found[1]->verify($now);
+        $found[1]->change('ADA@example.org', 'ada@example.org');
+        $this->addresses()->save($found[1]);
+        $this->clear();
+        self::assertSame($now->getTimestamp(), $this->addresses()->findByCanonical(AddressPurpose::Recovery, 'ada@example.org')?->verifiedAt()?->getTimestamp());
+
+        $this->addresses()->remove($this->addresses()->forAccount(self::ADA)[0]);
+        $this->clear();
+        self::assertSame([AddressPurpose::Recovery], array_map(static fn (AccountAddress $address): AddressPurpose => $address->purpose(), $this->addresses()->forAccount(self::ADA)));
+    }
+
+    public function testALinkTokenIsConsumedOnceRevokedAndPurged(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $id = static fn (string $letter): string => str_repeat($letter, 64);
+        $this->linkTokens()->save(LinkToken::issue($id('a'), self::ADA, 'reset', 'fingerprint-a', $now->modify('+1 hour'), $now));
+        $this->linkTokens()->save(LinkToken::issue($id('b'), self::ADA, 'verify', 'fingerprint-b', $now->modify('+1 day'), $now));
+        $this->linkTokens()->save(LinkToken::issue($id('c'), self::ADA, 'reset', 'fingerprint-c', $now->modify('+2 hours'), $now));
+        $this->linkTokens()->save(LinkToken::issue($id('d'), self::BOB, 'reset', 'fingerprint-d', $now->modify('+1 hour'), $now));
+        $this->clear();
+
+        $token = $this->linkTokens()->get($id('a'));
+        self::assertNotNull($token);
+        self::assertSame([self::ADA, 'reset', 'fingerprint-a'], [$token->accountId(), $token->purpose(), $token->fingerprint()]);
+        self::assertSame($now->modify('+1 hour')->getTimestamp(), $token->expiresAt()->getTimestamp());
+        self::assertSame($now->getTimestamp(), $token->createdAt()->getTimestamp());
+        self::assertNull($this->linkTokens()->get($id('e')));
+
+        self::assertTrue($this->linkTokens()->consume($id('a')));
+        self::assertFalse($this->linkTokens()->consume($id('a')));
+        self::assertFalse($this->linkTokens()->consume($id('e')));
+        self::assertNull($this->linkTokens()->get($id('a')));
+
+        self::assertSame(1, $this->linkTokens()->revoke(self::ADA, 'reset'));
+        self::assertSame(0, $this->linkTokens()->revoke(self::ADA, 'reset'));
+        self::assertNotNull($this->linkTokens()->get($id('b')));
+        self::assertSame(1, $this->linkTokens()->revoke(self::ADA));
+        self::assertNull($this->linkTokens()->get($id('b')));
+
+        self::assertSame(0, $this->linkTokens()->purge($now->modify('+1 hour')));
+        self::assertSame(1, $this->linkTokens()->purge($now->modify('+1 hour +1 second')));
+        self::assertNull($this->linkTokens()->get($id('d')));
+    }
+
     public function testAnAddressIsFoldedAsText(): void
     {
         $now = new DateTimeImmutable('2026-11-14 10:00:00');
@@ -630,6 +848,38 @@ abstract class RepositoryTestCase extends TestCase
     private function idsOf(array $items): array
     {
         return array_map(static fn (AccountSession|Consent|IssuedToken|LinkedIdentity|Passkey|SigningKey $item): string => $item instanceof SigningKey ? $item->kid() : $item->id(), $items);
+    }
+
+    /**
+     * The token endpoint over these stores, a client that asks refresh tokens, and a code issued to it.
+     *
+     * @return array{Tokens, InterleavedGrants, Client, string, Services}
+     */
+    private function provider(): array
+    {
+        $services = new Services();
+        $settings = new ProviderSettings('https://id.example', SigningAlgorithm::ES256);
+        $grants = new InterleavedGrants($this->grants());
+        new ClientRegistry($this->clients(), $services->clock, $settings, $services->journal)->register('app', 'App', ['https://app.example/cb'], [], ['offline_access']);
+        $client = $this->clients()->get('app');
+        self::assertInstanceOf(Client::class, $client);
+        $keys = new SigningKeys($this->keys(), new PlainSecretCipher(), $settings, $services->clock, new LockFactory(new InMemoryStore()));
+        $authorization = new Authorization($this->clients(), $grants, $settings, $services->clock, $services->journal);
+        $request = $authorization->parse(['response_type' => 'code', 'client_id' => 'app', 'redirect_uri' => 'https://app.example/cb', 'scope' => 'openid offline_access', 'code_challenge' => Pkce::challengeOf(self::VERIFIER), 'code_challenge_method' => 'S256']);
+        $code = Query::get($authorization->issueCode($request, $services->account(), $services->clock->now(), [], null), 'code');
+
+        return [new Tokens($this->clients(), $grants, $services->accounts, $keys, $settings, $services->clock, $services->journal), $grants, $client, $code, $services];
+    }
+
+    /**
+     * @return list<string> the tokens of the family still active, read again from the store
+     */
+    private function activeIn(string $family, DateTimeImmutable $now): array
+    {
+        return array_values(array_map(
+            static fn (IssuedToken $token): string => $token->id(),
+            array_filter($this->grants()->family($family), static fn (IssuedToken $token): bool => $token->isActive($now)),
+        ));
     }
 
     /**

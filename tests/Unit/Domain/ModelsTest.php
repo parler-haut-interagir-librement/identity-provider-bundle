@@ -5,14 +5,17 @@ declare(strict_types=1);
 namespace Phil\IdentityProviderBundle\Tests\Unit\Domain;
 
 use DateTimeImmutable;
+use Phil\IdentityProviderBundle\Domain\Account\AccountState;
 use Phil\IdentityProviderBundle\Domain\Exception\InvalidValue;
 use Phil\IdentityProviderBundle\Domain\Jose\SigningAlgorithm;
 use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
 use Phil\IdentityProviderBundle\Domain\Model\External\LinkedIdentity;
+use Phil\IdentityProviderBundle\Domain\Model\Link\LinkToken;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\AuthorizationCode;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\Client;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\Consent;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\IssuedToken;
+use Phil\IdentityProviderBundle\Domain\Model\Oidc\RevokedFamily;
 use Phil\IdentityProviderBundle\Domain\Model\Oidc\SigningKey;
 use Phil\IdentityProviderBundle\Domain\Model\Passkey\Passkey;
 use Phil\IdentityProviderBundle\Domain\Model\Session\AccountSession;
@@ -25,6 +28,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 
 #[CoversClass(Account::class)]
+#[CoversClass(LinkToken::class)]
 #[CoversClass(Passkey::class)]
 #[CoversClass(TotpCredential::class)]
 #[CoversClass(RecoveryCodeSet::class)]
@@ -35,6 +39,7 @@ use PHPUnit\Framework\TestCase;
 #[CoversClass(AuthorizationCode::class)]
 #[CoversClass(IssuedToken::class)]
 #[CoversClass(SigningKey::class)]
+#[CoversClass(RevokedFamily::class)]
 final class ModelsTest extends TestCase
 {
     private const string ID = '01JCZ6Q7Y3W0000000000000AB';
@@ -72,11 +77,36 @@ final class ModelsTest extends TestCase
         $account->grantRoles(['ROLE_ADMIN', 'ROLE_USER', 'ROLE_ADMIN']);
         self::assertSame(['ROLE_USER', 'ROLE_ADMIN'], $account->roles());
 
+        self::assertSame(AccountState::Active, $account->state());
+        self::assertNull($account->stateChangedAt());
+        self::assertFalse($account->isDisabled());
         $account->disable($now);
         $account->disable($now->modify('+1 day'));
         self::assertSame($now, $account->disabledAt());
-        $account->enable();
+        self::assertSame(AccountState::Suspended, $account->state());
+        self::assertTrue($account->isDisabled());
+        self::assertFalse($account->changeState(AccountState::Suspended, $now->modify('+2 days')));
+        self::assertTrue($account->changeState(AccountState::Closed, $now->modify('+3 days')));
+        $account->disable($now->modify('+4 days'));
+        self::assertSame(AccountState::Closed, $account->state());
+        self::assertEquals($now->modify('+3 days'), $account->stateChangedAt());
+        $account->enable($now->modify('+5 days'));
         self::assertNull($account->disabledAt());
+        self::assertSame(AccountState::Active, $account->state());
+        self::assertEquals($now->modify('+5 days'), $account->stateChangedAt());
+        self::assertFalse($account->isDisabled());
+
+        self::assertSame('ada@example.com', Account::register(self::ID, 'Ada@Example.com', $now)->emailCanonical());
+        $canonical = Account::register(self::ID, 'ada+news@example.com', $now, null, 'ada@example.com');
+        self::assertSame('ada+news@example.com', $canonical->email());
+        self::assertSame('ada@example.com', $canonical->emailCanonical());
+        $canonical->changeEmail('ADA+other@example.com', 'ada@example.com');
+        self::assertSame('ada+other@example.com', $canonical->email());
+        self::assertSame('ada@example.com', $canonical->emailCanonical());
+        $canonical->changeEmail('bob@example.com');
+        self::assertSame('bob@example.com', $canonical->emailCanonical());
+        self::assertSame('0192f5b4-7c1e-7a3b-9f00-123456789abc', Account::register('0192f5b4-7c1e-7a3b-9f00-123456789abc', 'ada@example.com', $now)->id());
+        self::assertSame('a', Account::register('a', 'ada@example.com', $now)->id());
     }
 
     public function testThePasswordAndTheLock(): void
@@ -130,12 +160,43 @@ final class ModelsTest extends TestCase
         }
     }
 
+    public function testALinkTokenRefusesValuesOutOfShape(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $id = str_repeat('a', 64);
+
+        self::assertSame(str_repeat('p', 16), LinkToken::issue($id, 'A', str_repeat('p', 16), str_repeat('f', 128), $now, $now)->purpose());
+        self::assertSame('', LinkToken::issue(str_repeat('0', 64), 'A', 'p', '', $now, $now)->fingerprint());
+
+        foreach ([
+            [str_repeat('a', 63), 'reset', 'f'],
+            [str_repeat('a', 65), 'reset', 'f'],
+            [str_repeat('A', 64), 'reset', 'f'],
+            [str_repeat('g', 64), 'reset', 'f'],
+            [$id."\n", 'reset', 'f'],
+            [$id, '', 'f'],
+            [$id, str_repeat('p', 17), 'f'],
+            [$id, 'reset', str_repeat('f', 129)],
+        ] as [$hash, $purpose, $fingerprint]) {
+            try {
+                LinkToken::issue($hash, 'A', $purpose, $fingerprint, $now, $now);
+                self::fail('Accepted.');
+            } catch (InvalidValue $invalid) {
+                self::assertStringContainsString('64 hexadecimal digits', $invalid->getMessage());
+            }
+        }
+    }
+
     public function testAnAccountRefusesValuesOutOfShape(): void
     {
         $now = new DateTimeImmutable();
 
         foreach ([
-            static fn (): Account => Account::register('short', 'ada@example.com', $now),
+            static fn (): Account => Account::register('', 'ada@example.com', $now),
+            static fn (): Account => Account::register(str_repeat('a', 37), 'ada@example.com', $now),
+            static fn (): Account => Account::register('with space', 'ada@example.com', $now),
+            static fn (): Account => Account::register('a@b', 'ada@example.com', $now),
+            static fn (): Account => Account::register("abc\n", 'ada@example.com', $now),
             static fn (): Account => Account::register(self::ID, 'no-at', $now),
             static fn (): Account => Account::register(self::ID, 'a@b@c', $now),
             static fn (): Account => Account::register(self::ID, 'a b@c', $now),
@@ -152,6 +213,7 @@ final class ModelsTest extends TestCase
         }
 
         self::assertSame(180, mb_strlen(Account::normalizeEmail(str_repeat('a', 174).'@b.cde')));
+        self::assertSame(str_repeat('a', 36), Account::register(str_repeat('a', 36), 'ada@example.com', $now)->id());
     }
 
     public function testAPasskey(): void
@@ -325,5 +387,15 @@ final class ModelsTest extends TestCase
         $key->retire($now);
         $key->retire($now->modify('+1 day'));
         self::assertSame([$now, false, false], [$key->retiredAt(), $key->isPending(), $key->isActive()]);
+    }
+
+    public function testTheMarkOfARevokedFamily(): void
+    {
+        $now = new DateTimeImmutable('2026-11-14 10:00:00');
+        $mark = RevokedFamily::mark('FAMILY0000000000000000000A', $now, $now->modify('+30 days'));
+
+        self::assertSame('FAMILY0000000000000000000A', $mark->family());
+        self::assertSame($now, $mark->revokedAt());
+        self::assertSame($now->modify('+30 days')->getTimestamp(), $mark->expiresAt()->getTimestamp());
     }
 }

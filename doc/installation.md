@@ -43,8 +43,48 @@ Argon2id (`sodium`). Generate the migration of the tables with `bin/console doct
   (`oidc.refresh_token_bound_to_session`, on by default); set it to `false` to keep the former behaviour.
 - `TokenController::AUTH_METHODS` is gone: the discovery document reads the methods from
   `oidc.client_authentication.methods`. `IssuedToken::accountId()` returns null for a token of the `client_credentials`
-  grant, and `GrantRepository` gains `useAssertion()`: an implementation of its own adds it. `Tokens::bearer()` gives a
-  third member, the client of the token.
+  grant, and `GrantRepository` gains `useAssertion()`, `revokeFamily()` and `isFamilyRevoked()`: an implementation of
+  its own adds them. `Tokens::bearer()` gives a third member, the client of the token.
+- The accounts gain the table `phil_identity_address`, and `phil_identity_account` the columns `email_canonical`
+  (unique), `state` and `state_changed_at` in place of `disabled_at`; every `account_id`, and the `id` of
+  `phil_identity_account`, holds up to 36 characters instead of a fixed 26. Run `bin/console doctrine:migrations:diff`,
+  then complete the migration it writes so that the rows keep their meaning, before the new columns become required:
+
+  ```sql
+  UPDATE phil_identity_account SET email_canonical = email;
+  UPDATE phil_identity_account SET state = 'suspended', state_changed_at = disabled_at WHERE disabled_at IS NOT NULL;
+  ```
+
+  With `accounts.strip_subaddress`, compute `email_canonical` with the bundle's `EmailCanonicalizer` instead, and settle
+  first the accounts that share a mailbox. The passkeys gain `attestation_format` and `attestation_type`, which default
+  to `none`.
+- `Account::enable()` takes the moment of the change, as `disable()` does; `AccountRepository` gains
+  `findByCanonicalEmail()`: an implementation of its own adds it. `Account::register()` and `changeEmail()` take the
+  canonical form, last and optional; an identifier holds 1 to 36 letters, digits and hyphens.
+- `Tokens`, `LogoutTokens` and `MetadataController` take a `SigningKeySource` — `SigningKeys` is one —, and
+  `Jws::encode()` takes a `Signer` — `PrivateKey` is one: code that passed them a `SigningKeys` or a `PrivateKey`
+  keeps working.
+- With `links.mode: stored`, the schema gains `phil_identity_link_token`: run `bin/console doctrine:migrations:diff` and
+  migrate. The links sent before the change of mode stop working.
+- With the module `oidc`, the schema gains the table `phil_identity_revoked_family`, the marks of the families of tokens
+  revoked: run `bin/console doctrine:migrations:diff` and migrate.
+- Every instant column — `expires_at`, `revoked_at`, `created_at` and the others — takes the Doctrine type
+  `datetime_utc_immutable`: the instants are written and read in UTC whatever the time zone of the process. The SQL
+  type is the same, so `doctrine:migrations:diff` writes no change. A database written by processes whose time zone
+  was not UTC holds local times: convert those columns to UTC once, before the upgrade goes live — for example, on
+  MySQL, `UPDATE phil_identity_token SET expires_at = CONVERT_TZ(expires_at, 'America/Toronto', '+00:00')` for each
+  instant column of the tables listed in [Tables](reference.md#tables), with the zone the processes ran in. A database
+  written in UTC needs nothing.
+- The account emails go through the transports of the Mailer component and the codes through the SMS transports of
+  the Notifier component, never through Messenger: `MailerAccountMailer` takes the transports and the body renderer
+  of Twig instead of `MailerInterface`, and the bundle hands `NotifierSmsSender` a texter without a bus. See [Why
+  account emails and SMS never go through Messenger](links-and-sms.md#why-account-emails-and-sms-never-go-through-messenger).
+- A client assertion names the issuer alone in its `aud`, as a string (draft-ietf-oauth-rfc7523bis): an assertion
+  for the token endpoint, or with its audiences in an array, is refused with `invalid_client`. Update those clients, or
+  set `oidc.client_authentication.legacy_assertion_audiences: true` while they are updated.
+  `ProviderSettings::assertionAudiences()` gives the issuer alone unless that option is on.
+- A client registered with `--pkce-optional` sends a `nonce` with every authorization request that carries no PKCE
+  challenge; a request with neither goes back to it with `invalid_request` (RFC 9700, section 2.1.1).
 
 ## Where the links point
 
@@ -89,6 +129,7 @@ security:
                 signature_properties: [userIdentifier, passwordChangedAt]
                 lifetime: 600
                 max_uses: 1
+                check_post_only: true         # set by the bundle whatever is written here
             custom_authenticators:
                 - Phil\IdentityProviderBundle\Infrastructure\Security\PasskeyAuthenticator     # passkeys
                 - Phil\IdentityProviderBundle\Infrastructure\Security\OneTimeCodeAuthenticator # totp
@@ -155,5 +196,7 @@ The sign-in form is the application's. A page offering passkeys includes the bun
 
 ## The schedule
 
-Run `phil:identity-provider:rotate-keys` daily when the provider is on, and `phil:identity-provider:purge` daily to
-remove expired codes and tokens and idle sessions, from the Scheduler component or a cron.
+Run `phil:identity-provider:rotate-keys` daily when the provider keeps its keys in the database, and
+`phil:identity-provider:purge` daily to remove expired codes, tokens and link tokens and idle sessions, from the
+Scheduler component or a cron. With `oidc.signing_keys.automatic_rotation: false`, the scheduled rotation changes
+nothing, and an operator rotates with `--force`.

@@ -1,4 +1,4 @@
-<!-- phil-dev source-sha256=1db44f284ef22c959bf28ff730d10c98ac648d74f432bf4aa70b6fc9bcd7013f -->
+<!-- phil-dev source-sha256=bce85f666bf089b2ff34b7418cd5f30f8f26526a853a5aee018b6dda6038df57 -->
 # Installation
 
 ```sh
@@ -49,8 +49,51 @@ utilisateurs : Argon2id (`sodium`). Générez la migration des tables avec `bin/
   (`oidc.refresh_token_bound_to_session`, activée par défaut) ; réglez-la à `false` pour garder l'ancien comportement.
 - `TokenController::AUTH_METHODS` a disparu : le document de découverte lit les méthodes dans
   `oidc.client_authentication.methods`. `IssuedToken::accountId()` retourne null pour un jeton de l'octroi
-  `client_credentials`, et `GrantRepository` gagne `useAssertion()` : une implémentation maison l'ajoute.
-  `Tokens::bearer()` donne un troisième membre, le client du jeton.
+  `client_credentials`, et `GrantRepository` gagne `useAssertion()`, `revokeFamily()` et `isFamilyRevoked()` : une implémentation
+  maison les ajoute. `Tokens::bearer()` donne un troisième membre, le client du jeton.
+- Les comptes gagnent la table `phil_identity_address`, et `phil_identity_account` les colonnes `email_canonical`
+  (unique), `state` et `state_changed_at` à la place de `disabled_at` ; chaque `account_id`, et l'`id` de
+  `phil_identity_account`, contient jusqu'à 36 caractères au lieu de 26 fixes. Lancez
+  `bin/console doctrine:migrations:diff`, puis complétez la migration qu'elle écrit pour que les lignes gardent leur
+  sens, avant que les nouvelles colonnes deviennent obligatoires :
+
+  ```sql
+  UPDATE phil_identity_account SET email_canonical = email;
+  UPDATE phil_identity_account SET state = 'suspended', state_changed_at = disabled_at WHERE disabled_at IS NOT NULL;
+  ```
+
+  Avec `accounts.strip_subaddress`, calculez plutôt `email_canonical` avec l'`EmailCanonicalizer` du bundle, et réglez
+  d'abord les comptes qui partagent une boîte de courriel. Les clés d'accès gagnent `attestation_format` et
+  `attestation_type`, qui valent `none` par défaut.
+- `Account::enable()` prend le moment du changement, comme `disable()` ; `AccountRepository` gagne
+  `findByCanonicalEmail()` : une implémentation maison l'ajoute. `Account::register()` et `changeEmail()` prennent la
+  forme canonique, en dernier et facultative ; un identifiant contient de 1 à 36 lettres, chiffres et traits d'union.
+- `Tokens`, `LogoutTokens` et `MetadataController` prennent une `SigningKeySource` — `SigningKeys` en est une —, et
+  `Jws::encode()` prend un `Signer` — `PrivateKey` en est un : le code qui leur passait un `SigningKeys` ou un
+  `PrivateKey` continue de fonctionner.
+- Avec `links.mode: stored`, le schéma gagne `phil_identity_link_token` : lancez `bin/console doctrine:migrations:diff`
+  et migrez. Les liens envoyés avant le changement de mode cessent de fonctionner.
+- Avec le module `oidc`, le schéma gagne la table `phil_identity_revoked_family`, les marques des familles de jetons
+  révoquées : lancez `bin/console doctrine:migrations:diff` et migrez.
+- Chaque colonne d'instant — `expires_at`, `revoked_at`, `created_at` et les autres — prend le type Doctrine
+  `datetime_utc_immutable` : les instants sont écrits et lus en UTC, quel que soit le fuseau horaire du processus. Le
+  type SQL est le même, donc `doctrine:migrations:diff` n'écrit aucun changement. Une base écrite par des processus
+  dont le fuseau horaire n'était pas UTC contient des heures locales : convertissez ces colonnes en UTC une seule
+  fois, avant la mise en service de la mise à niveau — par exemple, sur MySQL,
+  `UPDATE phil_identity_token SET expires_at = CONVERT_TZ(expires_at, 'America/Toronto', '+00:00')` pour chaque
+  colonne d'instant des tables listées dans [Tables](reference.md#tables), avec le fuseau dans lequel les processus
+  tournaient. Une base écrite en UTC n'a besoin de rien.
+- Les courriels de compte passent par les transports du composant Mailer et les codes par les transports SMS du
+  composant Notifier, jamais par Messenger : `MailerAccountMailer` prend les transports et le moteur de rendu du
+  corps de Twig au lieu de `MailerInterface`, et le bundle donne à `NotifierSmsSender` un texteur sans bus. Voir
+  [Pourquoi les courriels de compte et les SMS ne passent jamais par Messenger](links-and-sms.md#pourquoi-les-courriels-de-compte-et-les-sms-ne-passent-jamais-par-messenger).
+- Une assertion de client nomme l'émetteur seul dans son `aud`, sous forme de chaîne (draft-ietf-oauth-rfc7523bis) :
+  une assertion destinée au point de terminaison des jetons, ou dont les audiences sont dans un tableau, est refusée
+  avec `invalid_client`. Mettez ces clients à jour, ou réglez `oidc.client_authentication.legacy_assertion_audiences:
+  true` le temps de les mettre à jour. `ProviderSettings::assertionAudiences()` donne l'émetteur seul tant que cette
+  option n'est pas activée.
+- Un client enregistré avec `--pkce-optional` envoie un `nonce` avec chaque demande d'autorisation qui ne porte aucun
+  défi PKCE ; une demande sans l'un ni l'autre lui revient avec `invalid_request` (RFC 9700, section 2.1.1).
 
 ## Où mènent les liens
 
@@ -95,6 +138,7 @@ security:
                 signature_properties: [userIdentifier, passwordChangedAt]
                 lifetime: 600
                 max_uses: 1
+                check_post_only: true         # set by the bundle whatever is written here
             custom_authenticators:
                 - Phil\IdentityProviderBundle\Infrastructure\Security\PasskeyAuthenticator     # passkeys
                 - Phil\IdentityProviderBundle\Infrastructure\Security\OneTimeCodeAuthenticator # totp
@@ -163,6 +207,7 @@ Le formulaire de connexion est celui de l'application. Une page qui offre les cl
 
 ## La planification
 
-Lancez `phil:identity-provider:rotate-keys` chaque jour quand le fournisseur est activé, et
-`phil:identity-provider:purge` chaque jour pour retirer les codes et les jetons expirés et les sessions inactives, par
-le composant Scheduler ou par un cron.
+Lancez `phil:identity-provider:rotate-keys` chaque jour quand le fournisseur garde ses clés dans la base de données, et
+`phil:identity-provider:purge` chaque jour pour retirer les codes, les jetons et les jetons de lien expirés et les
+sessions inactives, par le composant Scheduler ou par un cron. Avec `oidc.signing_keys.automatic_rotation: false`, la
+rotation planifiée ne change rien, et un opérateur fait tourner les clés avec `--force`.

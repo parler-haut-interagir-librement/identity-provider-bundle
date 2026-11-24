@@ -1,4 +1,4 @@
-<!-- phil-dev source-sha256=6697d0cdc11291e1d640991605741b8015d9ff5a682abe4b33a15257053a5fcb -->
+<!-- phil-dev source-sha256=219aa6c7bf6462266984fd731b9dd5a51c77891efb6cd6d31181684133f1ca94 -->
 # Fournisseur OpenID Connect
 
 Le module `oidc` fait du site un fournisseur OpenID Connect pour ses clients : d'autres sites et applications
@@ -65,8 +65,11 @@ jetons seulement pour lui-même enregistre des ressources et aucune adresse de r
 
 Chaque client envoie un défi PKCE, sauf un client confidentiel enregistré avec `--pkce-optional` : le profil Basic
 d'OpenID Connect permet à un client confidentiel de se passer de PKCE, et il s'appuie alors sur son secret et sur le
-`nonce` que son jeton d'identité rapporte. Un défi envoyé malgré tout est vérifié de la même façon, et un client public
-ne peut jamais s'en passer.
+`nonce` que son jeton d'identité rapporte. Un tel client envoie un `nonce` avec chaque demande qui ne porte aucun défi,
+sans quoi la demande lui revient avec `invalid_request` (RFC 9700, section 2.1.1) : sans l'un ni l'autre, rien ne lierait
+le code à la session qui l'a demandé ; `oidc.require_nonce_without_pkce: false` lève cette règle, pour une suite de
+tests seulement. Un défi envoyé malgré tout est vérifié de la même façon, le `nonce` devenant alors facultatif, et un
+client public ne peut jamais s'en passer.
 
 ## Authentification des clients
 
@@ -89,6 +92,7 @@ phil_identity_provider:
             methods: [private_key_jwt, none]
             clock_skew: 60
             assertion_max_lifetime: 300
+            legacy_assertion_audiences: false
 ```
 
 Une assertion de client (RFC 7523, OpenID Connect Core, section 9) est un JSON Web Token signé avec l'une des clés du
@@ -96,9 +100,12 @@ client, celle que nomme son `kid`, avec l'algorithme propre à cette clé, et lu
 Web](#signatures-json-web) :
 
 - `iss` et `sub` sont l'identifiant du client ; `client_id`, quand il est envoyé, doit être le même ;
-- `aud` nomme l'émetteur, ou le point de terminaison des jetons à l'origine de l'émetteur —
-  `https://id.example.com/oidc/token` pour l'émetteur `https://id.example.com` —, jamais une adresse construite à partir
-  de la requête ;
+- `aud` est l'émetteur, sous forme de chaîne — `https://id.example.com` —, jamais une adresse construite à partir de la
+  requête (draft-ietf-oauth-rfc7523bis) : une assertion faite pour le point de terminaison des jetons ne peut pas être
+  rejouée à un autre point de terminaison du fournisseur, ni une assertion faite pour un autre serveur ici. Un client
+  écrit pour la RFC 7523, qui nomme le point de terminaison des jetons — `https://id.example.com/oidc/token` — ou met ses
+  audiences dans un tableau, n'est accepté qu'avec `legacy_assertion_audiences: true`, désactivé par défaut, jusqu'à sa
+  mise à jour ;
 - `exp` est obligatoire, échu d'au plus `clock_skew`, et pas plus loin devant que `assertion_max_lifetime` ; `iat` et
   `nbf`, quand ils sont présents, sont devant d'au plus `clock_skew` ;
 - `jti` est obligatoire, d'au plus 256 octets, et utilisé une seule fois : le fournisseur enregistre le SHA-256 du client
@@ -120,7 +127,8 @@ gardez la clé suivante seule.
    personne, jamais redirigé, de sorte que le fournisseur ne peut envoyer personne n'importe où ;
 2. un paramètre donné deux fois, un objet de requête (`request_not_supported`, `request_uri_not_supported`), un type de
    réponse autre que `code`, un mode de réponse autre que `query`, l'absence de la portée `openid`, un défi PKCE autre
-   que `S256`, de forme invalide, ou manquant quand le client en exige un, un `prompt` autre que `none`, `login` et
+   que `S256`, de forme invalide, ou manquant quand le client en exige un, aucun `nonce` dans une demande sans défi PKCE
+   (RFC 9700, section 2.1.1), un `prompt` autre que `none`, `login` et
    `consent` — le fournisseur n'affiche aucun sélecteur de compte, donc `select_account` est refusé plutôt qu'ignoré —,
    `prompt=none` avec une autre valeur, un `max_age` de forme invalide reviennent au client avec l'erreur, l'état et
    l'émetteur (RFC 9207) ;
@@ -244,17 +252,23 @@ connaissent. Userinfo prend le jeton d'accès dans l'en-tête `Authorization` ou
 
 ## Signatures JSON Web
 
-Chaque jeton que le fournisseur signe, et chaque jeton qu'il relit — les assertions de client comprises —, passe par `web-token/jwt-library` : `JWKFactory`
-crée les clés, `JWSBuilder` signe, `JWSVerifier` vérifie, `CompactSerializer` écrit et lit la forme compacte.
-`Application\Jose\Jws` borne un jeton avant que la bibliothèque le voie — au plus 8 Kio, trois parties, un en-tête et des
-revendications qui sont des objets JSON de profondeur bornée, un en-tête qui nomme un algorithme et une clé, ni `crit`
-ni `b64` —, puis le vérifie avec l'unique algorithme de la clé que son `kid` nomme ; `none` et les algorithmes HMAC ne
-sont jamais enregistrés. `Application\Jose\PrivateKey` garde une clé sous forme de JSON Web Key de la bibliothèque : une
-clé RSA de 3072 bits, une clé P-256 ou une clé Ed25519.
+Chaque jeton que le fournisseur relit — les siens et les assertions de client — passe par `web-token/jwt-library` :
+`CompactSerializer` lit la forme compacte et `JWSVerifier` la vérifie. `Application\Jose\Jws` borne un jeton avant que
+la bibliothèque le voie — au plus 8 Kio, trois parties, un en-tête et des revendications qui sont des objets JSON de
+profondeur bornée, un en-tête qui nomme un algorithme et une clé, ni `crit` ni `b64` —, puis le vérifie avec l'unique
+algorithme de la clé que son `kid` nomme ; `none` et les algorithmes HMAC ne sont jamais enregistrés.
 
-`tests/Benchmark/JwsBench.php` mesure chaque algorithme. La bibliothèque reconstruit le PEM d'une clé RSA à chaque
-signature, ce qui fait de RS256 le plus lent de loin — des millisecondes là où ES256 et EdDSA prennent des dizaines de
-microsecondes — : choisissez `ES256` ou `EdDSA` quand les clients les prennent en charge.
+`Jws::encode()` écrit un jeton avec un `Application\Contract\Signer` : l'en-tête — `alg`, `kid`, les membres donnés et
+`typ` —, les revendications, et la signature que le signeur donne sur les deux. `Application\Jose\PrivateKey`, le
+signeur de la base de données et des fichiers de clés, garde une clé sous forme de JSON Web Key de la bibliothèque —
+une clé RSA de 3072 bits, créée par `JWKFactory`, une clé P-256 ou une clé Ed25519 — et la charge une seule fois, quand
+elle est faite : une clé OpenSSL pour RS256 et ES256, la clé secrète de libsodium pour EdDSA. Chaque signature ne coûte
+alors que la signature.
+
+`tests/Benchmark/JwsBench.php` mesure chaque algorithme. Sur un portable récent, une signature RS256 prend environ
+2,2 ms avec la clé chargée, contre 3,6 ms quand la bibliothèque reconstruisait le PEM de la clé à chaque signature, et
+ES256 environ 33 µs contre 90 µs ; EdDSA prend environ 24 µs. Une signature RSA de 3072 bits reste la plus lente de
+loin : choisissez `ES256` ou `EdDSA` quand les clients les prennent en charge.
 
 ## Portées et revendications
 
@@ -286,7 +300,20 @@ final readonly class LocaleClaims implements ClaimsProvider
 }
 ```
 
-## Clés et rotation
+## Clés et leur rotation
+
+Les clés viennent de la source que nomme `oidc.signing_keys.source`, par le port `Application\Contract\SigningKeySource` :
+la clé qui signe, le jeu de clés que publie le document de découverte, et la clé publique d'un `kid`. Une source garde
+les clés qu'elle a chargées : la clé privée de RS256, l'algorithme par défaut, est déchiffrée et convertie en clé
+OpenSSL une fois par processus, non à chaque signature (voir [Signatures JSON Web](#signatures-json-web)).
+
+| Source | Où sont les clés | Rotation |
+|---|---|---|
+| `database`, par défaut | `phil_identity_signing_key`, scellées sous `secrets.kms_key` | Par `phil:identity-provider:rotate-keys` |
+| `file` | Les fichiers de `oidc.signing_keys.files`, scellés sous `secrets.kms_key` avec `sealed: true` | Par un déploiement |
+| `service` | Le service de `oidc.signing_keys.service`, comme l'adaptateur d'un module de sécurité matériel | Par le module |
+
+### La base de données
 
 `SigningKeys` garde les clés dans `phil_identity_signing_key`, leur JSON Web Key privée scellée par le `SecretCipher`. Un
 fournisseur sans clé en crée et en active une à son premier jeton. `phil:identity-provider:rotate-keys`, lancée chaque
@@ -296,14 +323,53 @@ en attente. Les clients qui mettent le jeu de clés en cache voient chaque clé 
 l'expiration du dernier jeton qu'elle a signé. Après l'exposition d'une clé, `--now` active tout de suite la clé en
 attente.
 
+Avec `oidc.signing_keys.automatic_rotation: false`, une exécution de la commande par le planificateur ne change rien et
+le dit, pour un fournisseur dont les opérateurs font tourner les clés à la main : `--force` fait tourner les clés,
+`--now` les fait tourner et active la nouvelle tout de suite.
+
 La première clé et chaque rotation se font sous un seul verrou, `phil_identity_provider.signing_keys`, pris à la
 `LockFactory` de `oidc.lock_factory` — `lock.factory` par défaut —, les clés étant relues une fois le verrou tenu : des
 instances qui démarrent, ou font la rotation, en même temps créent une clé, pas une chacune. Le magasin du verrou doit
 être partagé par tous les serveurs : un magasin `flock` ne protège qu'un serveur. Chaque lecture des clés règle encore
-ce qu'un magasin non partagé, ou des clés écrites avant, ont pu laisser, de la même façon sur chaque instance : de plusieurs clés actives, toutes sauf la dernière activée —
-le plus grand `kid` départageant une égalité — sont retirées, et restent publiées pour les jetons qu'elles ont signés ;
-de plusieurs clés en attente, toutes sauf la plus ancienne sont supprimées, n'ayant rien signé. Le règlement est
-journalisé comme `identity.oidc.key_rotated`, avec les clés retirées et le nombre de clés supprimées.
+ce qu'un magasin non partagé, ou des clés écrites avant, ont pu laisser, de la même façon sur chaque instance : de
+plusieurs clés actives, toutes sauf la dernière activée — le plus grand `kid` départageant une égalité — sont retirées,
+et restent publiées pour les jetons qu'elles ont signés ; de plusieurs clés en attente, toutes sauf la plus ancienne
+sont supprimées, n'ayant rien signé. Le règlement est journalisé comme `identity.oidc.key_rotated`, avec les clés
+retirées et le nombre de clés supprimées.
+
+La clé qui signe est gardée dans `LoadedKeys` sous son `kid`, qui nomme une seule clé pour toute sa vie : une rotation
+nomme une autre clé, chargée à son tour, et au plus quatre clés sont gardées.
+
+### Les fichiers de clés
+
+```yaml
+phil_identity_provider:
+    oidc:
+        algorithm: RS256
+        signing_keys:
+            source: file
+            sealed: true
+            files:
+                - '%kernel.project_dir%/config/keys/current.sealed'
+                - { path: '%kernel.project_dir%/config/keys/previous.sealed', kid: '2026-10' }
+```
+
+`FileSigningKeys` lit chaque fichier une fois par processus, au premier jeton signé ou lu : un PEM, une JSON Web Key
+privée ou, avec `sealed: true`, l'un ou l'autre scellé sous `secrets.kms_key` par
+`phil:identity-provider:seal-key <fichier>`, qui vérifie la clé et affiche le texte scellé. Le premier fichier signe ;
+les autres sont publiés, pour les jetons qu'ils ont signés. Le `kid` d'une clé est celui qui est donné, sinon
+l'empreinte JWK de sa clé publique (RFC 7638). Un fichier de plus de 64 Kio, une clé d'un autre algorithme, ou deux
+fichiers de même `kid` sont refusés au premier emploi. Le bundle ne fait jamais tourner ces clés : mettez la nouvelle
+clé en premier, gardez la précédente après elle tant que ses jetons peuvent encore être présentés, puis retirez-la.
+
+### Un module de sécurité matériel
+
+Une clé qui ne quitte jamais un module de sécurité matériel, ou un service de gestion de clés qui signe, est un
+adaptateur de l'application : un service qui implémente `SigningKeySource`, dont `active()` donne un
+`Application\Contract\Signer` — son `algorithm`, son `kid`, et `sign()`, qui envoie l'entrée de signature du JWS au
+module et rend la signature comme l'écrit JWA (pour ES256, `r` et `s` de 32 octets chacun, non le DER d'une
+signature) — et dont `jwks()` et `publicKey()` publient les clés publiques. Nommez-le dans
+`oidc.signing_keys.service` ; la rotation est celle du module.
 
 ## Consentement et déconnexion
 

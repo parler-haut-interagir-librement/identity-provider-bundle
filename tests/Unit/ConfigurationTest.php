@@ -42,6 +42,11 @@ final class ConfigurationTest extends TestCase
         'layout' => '@PhilIdentityProvider/layout.html.twig',
         'kit_subdirectory' => null,
         'public_origin' => null,
+        'accounts' => [
+            'id_generator' => 'ulid',
+            'strip_subaddress' => false,
+            'canonicalizer' => null,
+        ],
         'registration' => [
             'enabled' => true,
             'rate_limit' => [
@@ -64,6 +69,7 @@ final class ConfigurationTest extends TestCase
             'http_client' => 'http_client',
         ],
         'lockout' => [
+            'enabled' => true,
             'threshold' => 5,
             'base' => 60,
             'max' => 3600,
@@ -81,12 +87,21 @@ final class ConfigurationTest extends TestCase
         'links' => [
             'verify_lifetime' => 86400,
             'reset_lifetime' => 3600,
+            'mode' => 'signed',
         ],
         'passkeys' => [
             'rp_id' => null,
             'rp_name' => null,
             'origins' => [],
             'require_user_verification' => false,
+            'attestation' => [
+                'conveyance' => 'none',
+                'trusted_roots' => [],
+                'require_trusted' => false,
+                'allowed_aaguids' => [],
+                'denied_aaguids' => [],
+                'backup' => 'allowed',
+            ],
         ],
         'totp' => [
             'issuer' => null,
@@ -105,6 +120,8 @@ final class ConfigurationTest extends TestCase
         ],
         'sessions' => [
             'touch_interval' => 300,
+            'idle_timeout' => 7200,
+            'max_age' => 43200,
         ],
         'external' => [
             'link_verified_email' => false,
@@ -121,12 +138,21 @@ final class ConfigurationTest extends TestCase
             'retired_key_retention' => 604800,
             'allow_localhost' => false,
             'lock_factory' => 'lock.factory',
+            'signing_keys' => [
+                'source' => 'database',
+                'automatic_rotation' => true,
+                'files' => [],
+                'sealed' => false,
+                'service' => null,
+            ],
             'extra_scopes' => [],
             'client_authentication' => [
                 'methods' => ['client_secret_basic', 'client_secret_post', 'private_key_jwt', 'none'],
                 'clock_skew' => 60,
                 'assertion_max_lifetime' => 300,
+                'legacy_assertion_audiences' => false,
             ],
+            'require_nonce_without_pkce' => true,
             'refresh_token_bound_to_session' => true,
             'session_max_age' => null,
             'id_token' => [
@@ -217,6 +243,32 @@ final class ConfigurationTest extends TestCase
         $this->assertRefused(['oidc' => ['extra_scopes' => [1]]]);
     }
 
+    public function testASessionIdlesLongerThanItIsSeenAndBothBoundsMayBeTurnedOff(): void
+    {
+        $sessions = $this->process(['sessions' => ['touch_interval' => 0, 'idle_timeout' => 60]])['sessions'];
+        self::assertIsArray($sessions);
+        self::assertSame(60, $sessions['idle_timeout']);
+        $this->assertRefused(['sessions' => ['touch_interval' => 0, 'idle_timeout' => 59]]);
+
+        $sessions = $this->process(['sessions' => ['touch_interval' => 300, 'idle_timeout' => 301]])['sessions'];
+        self::assertIsArray($sessions);
+        self::assertSame(301, $sessions['idle_timeout']);
+        $this->assertRefused(['sessions' => ['touch_interval' => 300, 'idle_timeout' => 300]]);
+
+        $sessions = $this->process(['sessions' => ['touch_interval' => 9000, 'idle_timeout' => 0, 'max_age' => 0]])['sessions'];
+        self::assertIsArray($sessions);
+        self::assertSame(0, $sessions['idle_timeout']);
+        self::assertSame(0, $sessions['max_age']);
+        $this->assertRefused(['sessions' => ['idle_timeout' => -1]], 'greater than or equal to 0');
+
+        $sessions = $this->process(['sessions' => ['max_age' => 60]])['sessions'];
+        self::assertIsArray($sessions);
+        self::assertSame(60, $sessions['max_age']);
+        $this->assertRefused(['sessions' => ['max_age' => 59]]);
+        $this->assertRefused(['sessions' => ['max_age' => 1]]);
+        $this->assertRefused(['sessions' => ['max_age' => -1]], 'greater than or equal to 0');
+    }
+
     public function testARegistrationCountMayBeOne(): void
     {
         $registration = $this->process(['registration' => ['rate_limit' => ['per_ip' => ['limit' => 1], 'per_address' => ['limit' => 1]]]])['registration'];
@@ -242,6 +294,23 @@ final class ConfigurationTest extends TestCase
         }
 
         $this->assertRefused(['oidc' => ['algorithm' => 'HS256']]);
+
+        foreach (['signed', 'stored'] as $mode) {
+            $links = $this->process(['links' => ['mode' => $mode]])['links'];
+            self::assertIsArray($links);
+            self::assertSame($mode, $links['mode']);
+        }
+
+        $this->assertRefused(['links' => ['mode' => 'cookie']]);
+
+        foreach (['database', 'file', 'service'] as $source) {
+            $oidc = $this->process(['oidc' => ['signing_keys' => ['source' => $source]]])['oidc'];
+            self::assertIsArray($oidc);
+            self::assertIsArray($oidc['signing_keys']);
+            self::assertSame($source, $oidc['signing_keys']['source']);
+        }
+
+        $this->assertRefused(['oidc' => ['signing_keys' => ['source' => 'vault']]]);
     }
 
     /**
@@ -262,13 +331,14 @@ final class ConfigurationTest extends TestCase
     /**
      * @param array<string, mixed> $config
      */
-    private function assertRefused(array $config): void
+    private function assertRefused(array $config, string $reason = ''): void
     {
         try {
             $this->process($config);
             self::fail('The configuration is accepted.');
         } catch (InvalidConfigurationException $invalidConfigurationException) {
             self::assertStringContainsString('phil_identity_provider', $invalidConfigurationException->getMessage());
+            self::assertStringContainsString($reason, $invalidConfigurationException->getMessage());
         }
     }
 

@@ -6,6 +6,7 @@ namespace Phil\IdentityProviderBundle\Domain\Model\Oidc;
 
 use DateTimeImmutable;
 use Doctrine\ORM\Mapping as ORM;
+use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
 
 /**
  * An authorization code, as a row of `phil_identity_code`: the SHA-256 of the code — never the code —, the client,
@@ -31,7 +32,7 @@ final class AuthorizationCode
         private readonly string $id,
         #[ORM\Column(name: 'client_id', length: 64)]
         private readonly string $clientId,
-        #[ORM\Column(name: 'account_id', length: 26, options: ['fixed' => true])]
+        #[ORM\Column(name: 'account_id', length: Account::ID_MAX_LENGTH)]
         private readonly string $accountId,
         #[ORM\Column(name: 'redirect_uri', type: 'text')]
         private readonly string $redirectUri,
@@ -41,7 +42,7 @@ final class AuthorizationCode
         private readonly ?string $nonce,
         #[ORM\Column(name: 'code_challenge', length: 128, nullable: true)]
         private readonly ?string $codeChallenge,
-        #[ORM\Column(name: 'auth_time')]
+        #[ORM\Column(name: 'auth_time', type: 'datetime_utc_immutable')]
         private readonly DateTimeImmutable $authTime,
         #[ORM\Column(name: 'methods', type: 'json')]
         private readonly array $methods,
@@ -49,9 +50,9 @@ final class AuthorizationCode
         private readonly ?string $sessionId,
         #[ORM\Column(name: 'family', length: 26, options: ['fixed' => true])]
         private readonly string $family,
-        #[ORM\Column(name: 'expires_at')]
+        #[ORM\Column(name: 'expires_at', type: 'datetime_utc_immutable')]
         private readonly DateTimeImmutable $expiresAt,
-        #[ORM\Column(name: 'used_at', nullable: true)]
+        #[ORM\Column(name: 'used_at', type: 'datetime_utc_immutable', nullable: true)]
         private ?DateTimeImmutable $usedAt = null,
     ) {
     }

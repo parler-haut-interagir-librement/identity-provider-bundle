@@ -6,6 +6,7 @@ namespace Phil\IdentityProviderBundle\Domain\Model\Session;
 
 use DateTimeImmutable;
 use Doctrine\ORM\Mapping as ORM;
+use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
 
 /**
  * A signed-in session of an account, as a row of `phil_identity_session`: an opaque identifier the PHP session holds,
@@ -31,7 +32,7 @@ final class AccountSession
         #[ORM\Id]
         #[ORM\Column(name: 'id', length: 43, options: ['fixed' => true])]
         private readonly string $id,
-        #[ORM\Column(name: 'account_id', length: 26, options: ['fixed' => true])]
+        #[ORM\Column(name: 'account_id', length: Account::ID_MAX_LENGTH)]
         private readonly string $accountId,
         #[ORM\Column(name: 'device', length: self::DEVICE_MAX_LENGTH)]
         private readonly string $device,
@@ -39,11 +40,11 @@ final class AccountSession
         private array $methods,
         #[ORM\Column(name: 'risky')]
         private readonly bool $risky,
-        #[ORM\Column(name: 'created_at')]
+        #[ORM\Column(name: 'created_at', type: 'datetime_utc_immutable')]
         private readonly DateTimeImmutable $createdAt,
-        #[ORM\Column(name: 'last_seen_at')]
+        #[ORM\Column(name: 'last_seen_at', type: 'datetime_utc_immutable')]
         private DateTimeImmutable $lastSeenAt,
-        #[ORM\Column(name: 'closed_at', nullable: true)]
+        #[ORM\Column(name: 'closed_at', type: 'datetime_utc_immutable', nullable: true)]
         private ?DateTimeImmutable $closedAt = null,
     ) {
     }

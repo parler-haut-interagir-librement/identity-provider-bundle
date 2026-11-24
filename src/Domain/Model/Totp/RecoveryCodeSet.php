@@ -6,6 +6,7 @@ namespace Phil\IdentityProviderBundle\Domain\Model\Totp;
 
 use DateTimeImmutable;
 use Doctrine\ORM\Mapping as ORM;
+use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
 
 /**
  * The recovery codes of an account, as a row of `phil_identity_recovery_codes`: the keyed hash of each code, a used
@@ -22,11 +23,11 @@ final class RecoveryCodeSet
      */
     private function __construct(
         #[ORM\Id]
-        #[ORM\Column(name: 'account_id', length: 26, options: ['fixed' => true])]
+        #[ORM\Column(name: 'account_id', length: Account::ID_MAX_LENGTH)]
         private readonly string $accountId,
         #[ORM\Column(name: 'hashes', type: 'json')]
         private array $hashes,
-        #[ORM\Column(name: 'created_at')]
+        #[ORM\Column(name: 'created_at', type: 'datetime_utc_immutable')]
         private DateTimeImmutable $createdAt,
     ) {
     }

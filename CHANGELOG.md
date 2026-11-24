@@ -4,6 +4,133 @@ All notable changes to `phil/identity-provider-bundle` will be documented in thi
 
 Updates should follow the [Keep a CHANGELOG](https://keepachangelog.com/) principles.
 
+## 0.4.0-alpha - 2026-11-24
+
+The accounts take identifiers of up to 36 characters, a canonical address, a state in
+place of `disabled_at` and a table of addresses, to migrate with two updates; a table of revoked families to migrate;
+the instants are written in UTC, a database written in another time zone to convert once; a client assertion names
+the issuer alone in its `aud`, and a client without PKCE sends a `nonce`; sessions close after two hours without a
+request and twelve hours after they opened, unless `sessions.idle_timeout` and `sessions.max_age` say otherwise; a
+sign-in link is consumed by the button of the page it opens.
+See [Upgrading from 0.2](doc/installation.md#upgrading-from-02).
+
+### Added
+
+- `accounts.id_generator` and the port `Application\Contract\AccountIdGenerator`, which gives a new account its
+  identifier: `ulid`, the default (`Application\Identifier\UlidAccountIdGenerator`), `uuid_v7`
+  (`UuidV7AccountIdGenerator`, by the Uid component), or a service of the application. `Account::ID_PATTERN` and
+  `ID_MAX_LENGTH`: 1 to 36 letters, digits and hyphens. `Accounts` takes the generator, last and optional.
+- The canonical form of the sign-in address, `Account::emailCanonical()`, column `email_canonical`, unique:
+  registration with another spelling of a known mailbox answers as for the known address, and a change to it is
+  refused with `email.taken`. The port `Application\Contract\AddressCanonicalizer`, `Application\EmailCanonicalizer`,
+  `accounts.strip_subaddress` and `accounts.canonicalizer`; `AccountRepository::findByCanonicalEmail()`. `Accounts`
+  takes the canonicalizer, last and optional.
+- Addresses by purpose: `Domain\Account\AddressPurpose` (`sign_in`, `recovery`, `notices`),
+  `Domain\Model\Account\AccountAddress` in the table `phil_identity_address`, with a canonical form unique for each
+  purpose, `Domain\Contract\AccountAddressRepository` with its Doctrine and memory stores, and
+  `Application\AccountAddresses` (`set()`, `verify()`, `addressFor()`, `of()`, `get()`, `remove()`); the events
+  `identity.address.set`, `identity.address.verified` and `identity.address.removed`, and the key
+  `error.address.sign_in`, in English and in French.
+- Generic account states: `Domain\Account\AccountState` (`active`, `pending`, `suspended`, `closed`),
+  `Account::state()`, `stateChangedAt()` and `changeState()`, and `Accounts::changeState()`, which journals
+  `identity.account.state_changed` and closes the sessions of an account that leaves `active`.
+- `links.mode: stored`: the links that verify an address and reset a password carry a random token whose keyed hash
+  `phil_identity_link_token` keeps (`Domain\Model\Link\LinkToken`, `Domain\Contract\LinkTokenRepository` with its
+  Doctrine and memory stores), consumed once and revocable. `SignedLinks` takes the store, last and optional, and gains
+  `isStored()`, `consume()` and `revoke()`; `AccountLinks::consume()` and `revoke()`, which journals
+  `identity.links.revoked`. `phil:identity-provider:purge` removes the expired tokens.
+- `lockout.enabled` — `lockout: false` — and `LockoutPolicy::$enabled`: failed sign-ins are counted and lock nothing,
+  guessing being left to `login_limiter`.
+- The attestation of passkeys: `passkeys.attestation` (`conveyance`, `trusted_roots`, `require_trusted`,
+  `allowed_aaguids`, `denied_aaguids`, `backup`), `Domain\WebAuthn\AttestationPolicy`, `AttestationStatement`, which
+  reads the formats `none` and `packed` — self attestation, and certificates chained to the trusted roots —, and
+  `AttestationType` (`none`, `self`, `unverified`, `trusted`). `Passkey::attestationFormat()` and `attestationType()`,
+  columns `attestation_format` and `attestation_type`; `RegisteredCredential` carries them. A passkey that breaks the
+  policy is refused with `passkey.not_accepted`, in English and in French; `identity.passkey.added` carries `aaguid`,
+  `backup_eligible` and `attestation`. `RelyingParty` takes the policy, and `verifyRegistration()` the time the
+  certificates are checked at, both last and optional.
+- The source of the signing keys: `oidc.signing_keys` (`source`, `automatic_rotation`, `files`, `sealed`, `service`),
+  the ports `Application\Contract\SigningKeySource` and `Application\Contract\Signer`, `SigningKeys` as the source
+  `database`, `Application\Oidc\FileSigningKeys` for key files, and `phil:identity-provider:seal-key`, which seals a
+  key file under `secrets.kms_key`. `phil:identity-provider:rotate-keys` gains `--force`, and changes nothing without it
+  when `automatic_rotation` is false.
+- `PrivateKey::sign()` and `thumbprint()`, and `Application\Jose\LoadedKeys`, where `SigningKeys` keeps the key it
+  decrypted and loaded. `Der::ecdsaSignature()` and `Der::certificate()`.
+- The documentation of identifiers, states, addresses by purpose, stored links, turning the lock off, attestation and
+  the sources of the signing keys.
+
+### Changed
+
+- The account identifier of every table holds up to 36 characters instead of a fixed 26; `Account::register()` accepts
+  1 to 36 letters, digits and hyphens. `AccountUserProvider` tells an identifier from an address by the `@` of the
+  address. Migration: run `bin/console doctrine:migrations:diff` and apply it.
+- `disabled_at` of `phil_identity_account` gives way to `state` and `state_changed_at`: `Account::isDisabled()` is true
+  in any state but `active`, `disabledAt()` reads when the account stopped signing in, and `enable()` takes the moment
+  of the change. Migration: `UPDATE phil_identity_account SET state = 'suspended', state_changed_at = disabled_at WHERE
+  disabled_at IS NOT NULL`, and `UPDATE phil_identity_account SET email_canonical = email`, before the columns become
+  required.
+- `Account::register()` and `changeEmail()` take the canonical form, last and optional; `AccountRepository` gains
+  `findByCanonicalEmail()`.
+- With a conveyance other than `none`, the attestation statement of a new passkey is read: a `packed` statement whose
+  signature does not verify refuses the registration.
+- `Tokens`, `LogoutTokens` and `MetadataController` take a `SigningKeySource`, and `Jws::encode()` a `Signer`;
+  `SigningKeys` and `PrivateKey` are ones. `Jws::encode()` writes the token itself and signs with the key `PrivateKey`
+  loaded once — an OpenSSL key for RS256 and ES256, the libsodium secret key for EdDSA — instead of rebuilding it at
+  each signature: an RS256 signature takes about 2.2 ms instead of 3.6, ES256 about 33 µs instead of 90.
+- An Ed25519 private key whose public half is not the one of its seed is refused.
+- The tests of `phil:identity-provider:seal-key` read its message without the line breaks of the console, which wraps
+  its blocks at 80 columns: a long temporary path no longer splits `cannot be read` over two lines.
+- `MailerAccountMailer` takes the transports of the Mailer component (`Symfony\Component\Mailer\Transport\TransportInterface`)
+  and a `Symfony\Component\Mime\BodyRendererInterface` in place of `MailerInterface`; each account email has a text
+  part, `@PhilIdentityProvider/email/<message>.txt.twig`, that writes the link in full, and a `TrackingHeader` that
+  turns off the provider's tracking of opens and clicks. The default `SmsSender` is a `NotifierSmsSender` on a texter
+  of the SMS transports, without a bus, in place of the service `texter`.
+- `GrantRepository` gains `revokeFamily()` and `isFamilyRevoked()`; an implementation of its own adds them. The new
+  table `phil_identity_revoked_family` (`Domain\Model\Oidc\RevokedFamily`) keeps the marks of the families revoked,
+  removed by `phil:identity-provider:purge` once expired. Migration: run `bin/console doctrine:migrations:diff` and
+  apply it.
+- Every instant column of the bundle's tables is mapped as `datetime_utc_immutable`, and every instant a query passes
+  is typed so: the SQL type is the same, and `doctrine:migrations:diff` writes no change.
+- The `aud` of a client assertion is the issuer alone, as a string (draft-ietf-oauth-rfc7523bis):
+  `ProviderSettings::assertionAudiences()` gives the issuer, and an assertion for the token endpoint or with its
+  audiences in an array is `invalid_client`. `oidc.client_authentication.legacy_assertion_audiences`, off by default,
+  and `ProviderSettings::$legacyAssertionAudiences`, last and optional, accept both again.
+- `AuthorizationRequestParser` refuses, with `invalid_request` sent back to the client, a request that carries neither
+  a PKCE challenge nor a `nonce` (RFC 9700, section 2.1.1): a client registered with `--pkce-optional` sends a `nonce`.
+  `oidc.require_nonce_without_pkce`, on by default, `ProviderSettings::$nonceWithoutPkce` and the second argument of
+  `AuthorizationRequestParser`, both optional, lift the rule for a test suite; the conformance application does.
+- Requires the latest minor of each dependency (`doctrine/orm` 3.8, `doctrine/dbal` 4.6, `twig/twig` 3.31,
+  `phil/passwords` 0.2, …), and of each development requirement (`doctrine/doctrine-bundle` 3.4,
+  `symfony/ux-twig-component` 3.8, `symfony/dom-crawler` 8.2, `symfony/http-client-contracts` 3.8, …). The lockout
+  delay is computed in integers.
+
+### Fixed
+
+- The verification, reset and sign-in links went through `MailerInterface`, and the codes sent by text message through
+  the texter `texter`: where Messenger routes `SendEmailMessage` and `SmsMessage` to an asynchronous transport, as its
+  recipe does, the link or the code waited in the queue, in the failure transport and in their backups, where reading
+  it was enough to take the account. They are handed to the transports in the request, and nothing of them is queued.
+- When two requests presented one code or one refresh token, the one that lost could revoke the family after the
+  winner used the grant and before it saved its new tokens, which then stayed valid. The family is marked revoked
+  before its tokens are, and the winner reads the mark once its tokens are saved: they are revoked with the family and
+  the winner is refused.
+- The instants were written in the time zone of the process and read in the time zone of the reader: where the web
+  server and the workers or the console ran in different zones, an expiry read back was shifted, and a token past its
+  expiry could be accepted. They are written and read in UTC whatever the time zone of the process.
+
+### Security
+
+- A session of the provider lived as long as PHP kept it: a stolen session cookie stayed good. A session closes after
+  `sessions.idle_timeout` seconds without a request, 7200 by default, and `sessions.max_age` seconds after it opened,
+  43200 by default; `Sessions::touch()` and `Sessions::openFor()` close it as from another device, its tokens revoked,
+  and `identity.session.closed` carries the reason. `Sessions` takes both bounds, last and optional; 0 in the
+  configuration leaves a bound out.
+- A sign-in link was consumed by the GET that followed it: a mail scanner or a link preview burned its single use and
+  received the session. The bundle sets `check_post_only` on the `login_link` authenticator of its check route
+  (`LoginLinkPostOnlyPass`), and the route shows on GET a page whose button posts the link, without script, with no
+  referrer and out of caches (`LoginLinkController::confirm()`, `login_link/confirm.html.twig`, the keys
+  `login_link.confirm` and `action.sign_in_link`, in English and in French).
+
 ## 0.3.0-alpha - 2026-11-20
 
 The links of the emails point to `public_origin`, and the `prod` environment refuses

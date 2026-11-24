@@ -7,6 +7,7 @@ namespace Phil\IdentityProviderBundle\Domain\Model\External;
 use DateTimeImmutable;
 use Doctrine\ORM\Mapping as ORM;
 use Phil\IdentityProviderBundle\Domain\Exception\InvalidValue;
+use Phil\IdentityProviderBundle\Domain\Model\Account\Account;
 
 /**
  * An external identity linked to an account, as a row of `phil_identity_linked`: the provider's name, the subject it
@@ -29,15 +30,15 @@ final class LinkedIdentity
         #[ORM\Id]
         #[ORM\Column(name: 'id', length: 64, options: ['fixed' => true])]
         private readonly string $id,
-        #[ORM\Column(name: 'account_id', length: 26, options: ['fixed' => true])]
+        #[ORM\Column(name: 'account_id', length: Account::ID_MAX_LENGTH)]
         private readonly string $accountId,
         #[ORM\Column(name: 'provider', length: 64)]
         private readonly string $provider,
         #[ORM\Column(name: 'subject', length: self::SUBJECT_MAX_LENGTH)]
         private readonly string $subject,
-        #[ORM\Column(name: 'linked_at')]
+        #[ORM\Column(name: 'linked_at', type: 'datetime_utc_immutable')]
         private readonly DateTimeImmutable $linkedAt,
-        #[ORM\Column(name: 'last_used_at', nullable: true)]
+        #[ORM\Column(name: 'last_used_at', type: 'datetime_utc_immutable', nullable: true)]
         private ?DateTimeImmutable $lastUsedAt = null,
     ) {
     }
