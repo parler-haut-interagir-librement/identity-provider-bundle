@@ -4,6 +4,23 @@ All notable changes to `phil/identity-provider-bundle` will be documented in thi
 
 Updates should follow the [Keep a CHANGELOG](https://keepachangelog.com/) principles.
 
+## 0.4.1-alpha - 2026-11-25
+
+### Changed
+
+- The first parameter of `Totp::__construct()` and `Totp::fromBase32()` is named `$seed`, the seed of the one-time
+  passwords: a call that names it `secret:` names it `seed:`.
+
+### Security
+
+- Requires `twig/twig` 3.31.1 or later, which fixes the advisories of its sandbox published on 2026-11-24.
+- A refresh token bound to its session applies `sessions.max_age` and `sessions.idle_timeout`: a refresh touches the
+  session, closes it past either bound — its tokens revoked, its clients told, `identity.session.closed` written with
+  the reason — and is refused with `invalid_grant`, so a session never touched again cannot keep issuing tokens through
+  refresh. Within the bounds, a refresh counts as the activity of the session; no refresh token of a session expires
+  after `sessions.max_age`. `Tokens` takes `Sessions`, last and optional, and `Sessions::endsAt()` gives the end of a
+  session at its maximum age.
+
 ## 0.4.0-alpha - 2026-11-24
 
 The accounts take identifiers of up to 36 characters, a canonical address, a state in
@@ -58,6 +75,11 @@ See [Upgrading from 0.2](doc/installation.md#upgrading-from-02).
   decrypted and loaded. `Der::ecdsaSignature()` and `Der::certificate()`.
 - The documentation of identifiers, states, addresses by purpose, stored links, turning the lock off, attestation and
   the sources of the signing keys.
+- `password.semaphore` (`enabled`, `slots`, `wait`, `lock_factory`), on by default with 4 slots and a wait of 3
+  seconds: `Infrastructure\Security\PasswordCheckSemaphore`, `SemaphorePasswordHasher` and
+  `SemaphorePasswordHasherFactory`, a decorator of `security.password_hasher_factory`, cap the password hashes and
+  checks of the accounts computed at once on each server, by locks of the Lock component on flock files by default;
+  past the wait the sign-in is refused with `password.busy`, which never counts towards the lock of the account.
 
 ### Changed
 
@@ -130,6 +152,13 @@ See [Upgrading from 0.2](doc/installation.md#upgrading-from-02).
   (`LoginLinkPostOnlyPass`), and the route shows on GET a page whose button posts the link, without script, with no
   referrer and out of caches (`LoginLinkController::confirm()`, `login_link/confirm.html.twig`, the keys
   `login_link.confirm` and `action.sign_in_link`, in English and in French).
+- A burst of failed sign-ins spread over many accounts and addresses passed under the limiters and hashed every
+  password at once, each Argon2id hash taking tens of mebibytes, until the server ran out of memory: the hashes wait
+  for a slot of `password.semaphore`.
+- The limiters of the sign-ins and of the registrations keyed their counts by the HMAC of the address and of the
+  identifier under `secret` itself, the same hash other bundles kept for the same address. `LoginRateLimiter` and
+  `RegistrationRateLimiter` derive their keys by HKDF-SHA256 under `phil_identity_provider.login_limiter` and
+  `phil_identity_provider.registration_limiter` (`USAGE` of each). The counts start again at the update.
 
 ## 0.3.0-alpha - 2026-11-20
 

@@ -1,4 +1,4 @@
-<!-- phil-dev source-sha256=80af160fdb92c496ec69073eb337415ac0dab30d422313a99cb68453a8437051 -->
+<!-- phil-dev source-sha256=b43cfb0ccda7fad3cc54b811f1661ccab8ae621016a2da266b7c67ad1a5f8116 -->
 # Configuration
 
 La configuration du bundle se trouve sous `phil_identity_provider`. Chaque option a une valeur par défaut, sauf les
@@ -90,6 +90,10 @@ phil_identity_provider:
 | `password.min_score` | `2` | Le plus bas score de l'estimateur de force de `phil/passwords`, de 0 à 4. |
 | `password.breach_check` | `false` | Si un nouveau mot de passe est cherché dans Pwned Passwords, par k-anonymat : seuls cinq caractères de son SHA-1 quittent le serveur. |
 | `password.http_client` | `http_client` | Le client HTTP de la vérification des fuites. |
+| `password.semaphore.enabled` | `true` | Plafonne les empreintes et vérifications de mots de passe des comptes calculées en même temps sur chaque serveur ; `semaphore: false` désactive le plafond. Voir [Le plafond des vérifications de mot de passe](accounts.md#le-plafond-des-vérifications-de-mot-de-passe). |
+| `password.semaphore.slots` | `4` | Combien d'empreintes s'exécutent en même temps, de 1 à 256 : environ le nombre de cœurs du processeur. |
+| `password.semaphore.wait` | `3.0` | Combien de temps une empreinte attend une place, en secondes, avant que la connexion soit refusée avec `password.busy`. |
+| `password.semaphore.lock_factory` | `null` | Un service `LockFactory` sur un magasin local à chaque serveur ; null garde des fichiers flock dans le répertoire temporaire. |
 | `lockout.enabled` | `true` | Si les échecs de connexion par mot de passe verrouillent le compte ; `lockout: false` les compte sans rien verrouiller et laisse les essais à `login_limiter`. Voir [Le verrou](accounts.md#le-verrou). |
 | `lockout.threshold` | `5` | Échecs de connexion par mot de passe de suite avant le premier verrou. |
 | `lockout.base` | `60` | Secondes du premier verrou, doublées à chaque échec de plus. |
@@ -125,8 +129,8 @@ phil_identity_provider:
 | `step_up.attribute` | `PHIL_STEP_UP` | L'attribut qu'exigent les actions sensibles du bundle : `PHIL_STEP_UP`, ou `IS_AUTHENTICATED_RECENTLY` de Symfony Security. |
 | `step_up.lifetime` | `300` | Secondes pendant lesquelles une preuve accorde `PHIL_STEP_UP`. |
 | `sessions.touch_interval` | `300` | Le moins de secondes entre deux écritures du moment où une session a été vue pour la dernière fois. |
-| `sessions.idle_timeout` | `7200` | Le nombre de secondes sans requête après lequel une session est fermée : 0 pour aucune borne, sinon au moins 60 et plus que `sessions.touch_interval`. |
-| `sessions.max_age` | `43200` | Le nombre de secondes après son ouverture au-delà duquel une session est fermée, quelle que soit son activité : 0 pour aucune borne, sinon au moins 60. |
+| `sessions.idle_timeout` | `7200` | Le nombre de secondes sans requête après lequel une session est fermée : 0 pour aucune borne, sinon au moins 60 et plus que `sessions.touch_interval`. L'actualisation d'un jeton OpenID Connect lié à la session compte comme une requête. |
+| `sessions.max_age` | `43200` | Le nombre de secondes après son ouverture au-delà duquel une session est fermée, quelle que soit son activité : 0 pour aucune borne, sinon au moins 60. Un jeton d'actualisation lié à la session expire à ce moment, et une actualisation au-delà ferme la session. |
 | `external.link_verified_email` | `false` | Si une identité dont le fournisseur a vérifié l'adresse se lie au compte qui a vérifié la même adresse, au lieu de demander à la personne de se connecter d'abord. |
 | `external.register` | `true` | Si une identité externe inconnue crée un compte. |
 | `oidc.issuer` | `null` | L'adresse https sous laquelle les clients connaissent le fournisseur, sans barre oblique finale. |
@@ -150,7 +154,7 @@ phil_identity_provider:
 | `oidc.client_authentication.assertion_max_lifetime` | `300` | Le plus loin devant, en secondes, que peut être l'expiration d'une assertion de client, de 1 à 3600 ; son `jti` est gardé aussi longtemps. |
 | `oidc.client_authentication.legacy_assertion_audiences` | `false` | Si une assertion de client peut aussi nommer le point de terminaison des jetons à l'origine de l'émetteur, et ses audiences dans un tableau ; désactivé, son `aud` est l'émetteur, sous forme de chaîne (draft-ietf-oauth-rfc7523bis). |
 | `oidc.require_nonce_without_pkce` | `true` | Si une demande d'autorisation sans défi PKCE, d'un client enregistré avec `--pkce-optional`, doit porter un `nonce` (RFC 9700, section 2.1.1) ; `false` seulement pour une suite de tests qui joue un tel client sans `nonce`. |
-| `oidc.refresh_token_bound_to_session` | `true` | Si un jeton d'actualisation émis dans une session est refusé une fois la session fermée ou plus vieille que `oidc.session_max_age`, sa famille révoquée. |
+| `oidc.refresh_token_bound_to_session` | `true` | Si un jeton d'actualisation émis dans une session est refusé une fois la session fermée, au-delà de `sessions.idle_timeout` ou de `sessions.max_age` — l'actualisation la ferme alors —, ou plus vieille que `oidc.session_max_age`, sa famille révoquée ; une actualisation compte comme l'activité de la session. |
 | `oidc.session_max_age` | `null` | Secondes après l'ouverture d'une session au-delà desquelles ses jetons d'actualisation ne sont plus émis ni acceptés ; null pour aucune borne que la fin de la session. |
 | `oidc.id_token.acr` | `null` | L'`acr` de chaque jeton d'identité ; null pour aucun. |
 | `oidc.id_token.idp` | `null` | L'`idp` de chaque jeton d'identité ; null pour aucun. |
